@@ -126,14 +126,33 @@ def connect_to_azure_sql(username, password, server="ph-radc-server-eastus.datab
         # Log connection attempt
         st.info(f"Attempting to connect to server: {server}")
         
-        # Create connection string with all options for maximum compatibility
-        conn_str = f"DRIVER={{ODBC Driver 13 for SQL Server}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        # Create connection string with ODBC Driver 17 (updated from 13)
+        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
         
         # Attempt connection
         conn = pyodbc.connect(conn_str)
         return conn
     except pyodbc.Error as e:
         st.error(f"ODBC Connection Error: {str(e)}")
+        
+        # Try pymssql as fallback
+        try:
+            st.info("Trying pymssql as fallback...")
+            if pymssql_available:
+                import pymssql
+                conn = pymssql.connect(
+                    server=server.replace('.database.windows.net', ''),
+                    user=username,
+                    password=password,
+                    database=database
+                )
+                st.success("Connected using pymssql!")
+                return conn
+            else:
+                st.error("pymssql not available as fallback")
+        except Exception as pymssql_error:
+            st.error(f"pymssql connection also failed: {str(pymssql_error)}")
+        
         # Add troubleshooting info
         st.info("""
         Troubleshooting Tips:

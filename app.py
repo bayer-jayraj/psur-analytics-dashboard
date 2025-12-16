@@ -25,6 +25,51 @@ st.set_page_config(
     layout="wide"
 )
 
+# ============================================================================
+# CONFIGURATION CONSTANTS - Easy to update for future years
+# ============================================================================
+LAST_FULL_YEAR = 2024  # Hardcoded as per requirement
+CURRENT_YEAR = 2025    # Hardcoded as per requirement
+
+# ============================================================================
+# REGION MAPPING for Chart 2 (EEA_CH_TR, ROW, USA grouping)
+# ============================================================================
+# EEA (European Economic Area) + Switzerland + Turkey
+EEA_CH_TR_COUNTRIES = [
+    # EU Member States
+    'Austria', 'Belgium', 'Bulgaria', 'Croatia', 'Cyprus', 'Czech Republic',
+    'Denmark', 'Estonia', 'Finland', 'France', 'Germany', 'Greece', 'Hungary',
+    'Ireland', 'Italy', 'Latvia', 'Lithuania', 'Luxembourg', 'Malta',
+    'Netherlands', 'Poland', 'Portugal', 'Romania', 'Slovakia', 'Slovenia',
+    'Spain', 'Sweden',
+    # EEA non-EU
+    'Iceland', 'Liechtenstein', 'Norway',
+    # Additional countries in this region
+    'Switzerland', 'Turkey',
+    # Common abbreviations and variations
+    'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR',
+    'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK',
+    'SI', 'ES', 'SE', 'IS', 'LI', 'NO', 'CH', 'TR'
+]
+
+USA_COUNTRIES = [
+    'United States', 'USA', 'US', 'United States of America'
+]
+
+def get_region(country):
+    """Map a country to its region (EEA_CH_TR, USA, or ROW)"""
+    if not country or pd.isna(country):
+        return 'Unknown'
+    
+    country_str = str(country).strip()
+    
+    if country_str in USA_COUNTRIES or country_str.upper() in ['US', 'USA']:
+        return 'USA'
+    elif country_str in EEA_CH_TR_COUNTRIES or country_str.upper() in [c.upper() for c in EEA_CH_TR_COUNTRIES]:
+        return 'EEA_CH_TR'
+    else:
+        return 'ROW'
+
 # Initialize session state
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
@@ -127,7 +172,7 @@ def connect_to_azure_sql(username, password, server="ph-radc-server-eastus.datab
         st.info(f"Attempting to connect to server: {server}")
         
         # Create connection string with all options for maximum compatibility
-        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        conn_str = f"DRIVER={{ODBC Driver 13 for SQL Server}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
         
         # Attempt connection
         conn = pyodbc.connect(conn_str)
@@ -146,6 +191,52 @@ def connect_to_azure_sql(username, password, server="ph-radc-server-eastus.datab
     except Exception as e:
         st.error(f"General Error: {str(e)}")
         return None
+
+# ============================================================================
+# DATA VALIDATION HELPER FUNCTIONS
+# ============================================================================
+def check_data_availability(conn, table_name, date_column, product_line=None, brand_column=None):
+    """
+    Check data availability for a given table and return date range info.
+    Helps identify data gaps gracefully.
+    """
+    try:
+        where_clause = ""
+        if product_line and brand_column:
+            where_clause = f"WHERE {brand_column} = '{product_line}'"
+        
+        query = f"""
+        SELECT 
+            MIN(TRY_CONVERT(date, {date_column})) as min_date,
+            MAX(TRY_CONVERT(date, {date_column})) as max_date,
+            COUNT(*) as record_count,
+            COUNT(DISTINCT YEAR(TRY_CONVERT(date, {date_column}))) as year_count
+        FROM {table_name}
+        {where_clause}
+        """
+        df = pd.read_sql(query, conn)
+        return df.iloc[0].to_dict() if not df.empty else None
+    except Exception as e:
+        return None
+
+def get_years_with_data(conn, table_name, date_column, product_line=None, brand_column=None):
+    """Get list of years that have data in the table"""
+    try:
+        where_clause = ""
+        if product_line and brand_column:
+            where_clause = f"WHERE {brand_column} = '{product_line}'"
+        
+        query = f"""
+        SELECT DISTINCT YEAR(TRY_CONVERT(date, {date_column})) as data_year
+        FROM {table_name}
+        {where_clause}
+        AND {date_column} IS NOT NULL
+        ORDER BY data_year
+        """
+        df = pd.read_sql(query, conn)
+        return df['data_year'].tolist() if not df.empty else []
+    except Exception as e:
+        return []
 
 # Login Page
 if not st.session_state['logged_in']:
@@ -189,7 +280,7 @@ if not st.session_state['logged_in']:
                     st.session_state['conn'] = conn
                     st.session_state['logged_in'] = True
                     st.success("Connected to Azure SQL Database successfully!")
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 st.warning("Please enter both username and password")
     
@@ -397,15 +488,20 @@ else:
             )
         
         with col2:
-            st.info("""
+            st.info(f"""
             ### PSUR Report Information
             
             This report will include:
-            - Sales by Country (by Year)
+            - **Chart 1**: Sales by Country with Product Type & Years as Columns
+            - **Chart 2**: Sales by Region (EEA_CH_TR/ROW/USA) with Product Type
             - Adverse Events Analysis
             - Field Notices / Recalls
             - Customer Complaint / User Feedback Review
             - Complaints per Final Object Code
+            
+            **Configuration:**
+            - Last Full Year: **{LAST_FULL_YEAR}**
+            - Current Year: **{CURRENT_YEAR}**
             
             **Note:** Charts display top 10 values only.
             Required fields must be filled. Optional fields can be left blank to include all values.
@@ -428,6 +524,9 @@ else:
                     st.write(f"- Countries: {', '.join(selected_countries)}")
                 else:
                     st.write(f"- Countries: All")
+                
+                # Calculate last year in user's selected range for complaint tables
+                last_year_in_range = min(end_date.year, LAST_FULL_YEAR)
                 
                 try:
                     with st.spinner("Generating PSUR report..."):
@@ -463,68 +562,134 @@ else:
                             conditions = [f"{column_name} = '{var}'" for var in all_variations]
                             return f"AND ({' OR '.join(conditions)})"
                         
-                        # 1. SALES BY COUNTRY (AGGREGATED ACROSS ALL YEARS)
-                        st.subheader("1. Sales by Country and Year")
+                        # ================================================================
+                        # 1. SALES BY COUNTRY AND YEAR - CHART 1 (Individual Countries)
+                        # ================================================================
+                        st.subheader("1. Sales Analysis")
                         
-                        # Query for Sales by Country aggregated across all years
+                        # CHANGE 1 & 2: Query for Sales with Product Type (Disposable vs Injector)
                         sales_query = f"""
-                        WITH SalesByCatalog AS (
-                            SELECT 
-                                s.Country_final_dest,
-                                YEAR(s.[Date]) as SaleYear,
-                                m.ProductGroup,
-                                SUM(s.Quantity) as TotalQuantity
-                            FROM Sales s
-                            LEFT JOIN MaterialReference m ON s.Material = m.MATNo
-                            WHERE (m.Brand = '{selected_product_line}' OR m.ProductGroup = '{selected_product_line}')
-                            AND s.[Date] >= '{start_date_str}'
-                            AND s.[Date] <= '{end_date_str}'
-                            {f"AND m.CATALOG = '{selected_catalog}'" if selected_catalog else ""}
-                            {get_country_filter('s.Country_final_dest', selected_countries)}
-                            GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.ProductGroup
-                        )
-                        SELECT * FROM SalesByCatalog
-                        WHERE Country_final_dest IS NOT NULL
-                        AND ProductGroup IS NOT NULL
-                        AND SaleYear IS NOT NULL
-                        ORDER BY SaleYear, Country_final_dest, ProductGroup
+                        SELECT 
+                            s.Country_final_dest,
+                            YEAR(s.[Date]) as SaleYear,
+                            m.DisposableCategory as ProductType,
+                            SUM(s.Quantity) as TotalQuantity
+                        FROM Sales s
+                        LEFT JOIN MaterialReference m ON s.Material = m.MATNo
+                        WHERE (m.Brand = '{selected_product_line}' OR m.ProductGroup = '{selected_product_line}')
+                        AND s.[Date] >= '{start_date_str}'
+                        AND s.[Date] <= '{end_date_str}'
+                        {f"AND m.CATALOG = '{selected_catalog}'" if selected_catalog else ""}
+                        {get_country_filter('s.Country_final_dest', selected_countries)}
+                        AND m.DisposableCategory IS NOT NULL
+                        GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.DisposableCategory
                         """
                         
                         sales_by_country = pd.read_sql(sales_query, st.session_state['conn'])
                         
                         if not sales_by_country.empty:
-                            # Create pivot table for better display (Year x Country)
-                            sales_pivot = sales_by_country.pivot_table(
-                                index=['Country_final_dest', 'SaleYear'],
-                                columns='ProductGroup', 
+                            # ============================================================
+                            # CHART 1: Sales by Country with Product Type, Years as Columns
+                            # ============================================================
+                            st.write("### Chart 1: Sales by Country and Product Type")
+                            st.write(f"**Table 4a: {selected_product_line} Sales by Country ({start_date.year} - {end_date.year})**")
+                            
+                            # Create pivot table: Country + ProductType as rows, Years as columns
+                            sales_pivot_country = sales_by_country.pivot_table(
+                                index=['Country_final_dest', 'ProductType'],
+                                columns='SaleYear',
                                 values='TotalQuantity',
-                                fill_value=0
+                                fill_value=0,
+                                aggfunc='sum'
                             ).reset_index()
                             
-                            # Format SaleYear as integer without commas
-                            sales_pivot['SaleYear'] = sales_pivot['SaleYear'].astype(int)
+                            # Rename columns for clarity
+                            sales_pivot_country.columns.name = None
                             
-                            st.write("**Table 4: Sales by Country and Year**")
-                            # Use custom formatting to display years without commas
-                            st.dataframe(sales_pivot.style.format({'SaleYear': '{:.0f}'}))
+                            # Format year columns as integers (no decimals)
+                            year_columns = [col for col in sales_pivot_country.columns if isinstance(col, (int, float)) and col > 2000]
                             
-                            # Create sales visualization - Aggregated by Country (Top 10)
-                            sales_summary = sales_by_country.groupby('Country_final_dest')['TotalQuantity'].sum().reset_index()
-                            sales_summary = sales_summary.nlargest(10, 'TotalQuantity')
+                            # Sort by country then product type
+                            sales_pivot_country = sales_pivot_country.sort_values(['Country_final_dest', 'ProductType'])
                             
-                            fig = px.bar(
-                                sales_summary,
+                            # Display the table
+                            st.dataframe(sales_pivot_country.style.format(
+                                {col: '{:,.0f}' for col in year_columns}
+                            ), use_container_width=True)
+                            
+                            # Create grouped bar chart for Chart 1 (Top 10 countries)
+                            # Aggregate by country first
+                            country_totals = sales_by_country.groupby('Country_final_dest')['TotalQuantity'].sum().nlargest(10).index.tolist()
+                            chart1_data = sales_by_country[sales_by_country['Country_final_dest'].isin(country_totals)]
+                            
+                            fig1 = px.bar(
+                                chart1_data,
                                 x='Country_final_dest',
                                 y='TotalQuantity',
-                                title=f"{selected_product_line} Sales by Country (Top 10)",
-                                labels={'TotalQuantity': 'Total Quantity', 'Country_final_dest': 'Country'}
+                                color='ProductType',
+                                barmode='group',
+                                title=f"{selected_product_line} Sales by Country and Product Type ({start_date.year} - {end_date.year}) - Top 10",
+                                labels={'TotalQuantity': 'Total Quantity', 'Country_final_dest': 'Country', 'ProductType': 'Product Type'}
                             )
-                            fig.update_layout(xaxis_tickangle=-45)
-                            st.plotly_chart(fig, use_container_width=True)
+                            fig1.update_layout(xaxis_tickangle=-45)
+                            st.plotly_chart(fig1, use_container_width=True)
+                            
+                            # ============================================================
+                            # CHART 2: Sales by Region (EEA_CH_TR, ROW, USA) with Product Type
+                            # ============================================================
+                            st.write("### Chart 2: Sales by Region and Product Type")
+                            st.write(f"**Table 4b: {selected_product_line} Sales by Region ({start_date.year} - {end_date.year})**")
+                            
+                            # Add region column
+                            sales_by_country['Region'] = sales_by_country['Country_final_dest'].apply(get_region)
+                            
+                            # Aggregate by Region, ProductType, and Year
+                            sales_by_region = sales_by_country.groupby(['Region', 'ProductType', 'SaleYear'])['TotalQuantity'].sum().reset_index()
+                            
+                            # Create pivot table: Region + ProductType as rows, Years as columns
+                            sales_pivot_region = sales_by_region.pivot_table(
+                                index=['Region', 'ProductType'],
+                                columns='SaleYear',
+                                values='TotalQuantity',
+                                fill_value=0,
+                                aggfunc='sum'
+                            ).reset_index()
+                            
+                            sales_pivot_region.columns.name = None
+                            
+                            # Sort by region order (EEA_CH_TR, ROW, USA)
+                            region_order = {'EEA_CH_TR': 0, 'ROW': 1, 'USA': 2}
+                            sales_pivot_region['sort_key'] = sales_pivot_region['Region'].map(region_order)
+                            sales_pivot_region = sales_pivot_region.sort_values(['sort_key', 'ProductType']).drop('sort_key', axis=1)
+                            
+                            # Display the table
+                            year_columns_region = [col for col in sales_pivot_region.columns if isinstance(col, (int, float)) and col > 2000]
+                            st.dataframe(sales_pivot_region.style.format(
+                                {col: '{:,.0f}' for col in year_columns_region}
+                            ), use_container_width=True)
+                            
+                            # Create grouped bar chart for Chart 2
+                            fig2 = px.bar(
+                                sales_by_region,
+                                x='Region',
+                                y='TotalQuantity',
+                                color='ProductType',
+                                barmode='group',
+                                title=f"{selected_product_line} Sales by Region and Product Type ({start_date.year} - {end_date.year})",
+                                labels={'TotalQuantity': 'Total Quantity', 'Region': 'Region', 'ProductType': 'Product Type'},
+                                category_orders={'Region': ['EEA_CH_TR', 'ROW', 'USA']}
+                            )
+                            st.plotly_chart(fig2, use_container_width=True)
+                            
+                            # Add footnote explaining product categories
+                            st.caption("*Disposables category includes sales of syringes and high-pressure connector tubing. Injector category includes injector hardware units.")
+                            
                         else:
                             st.info("No sales data found for the selected criteria.")
                         
+                        # ================================================================
                         # 2. ADVERSE EVENTS
+                        # ================================================================
                         st.subheader("2. Adverse Events")
                         
                         # Adverse Events by Type and Year
@@ -562,20 +727,19 @@ else:
                             for i, column in enumerate(ae_pivot.columns):
                                 fig.add_trace(go.Bar(
                                     name=column,
-                                    x=ae_pivot.index,
+                                    x=ae_pivot.index.astype(int).astype(str),  # Convert to string to avoid decimals
                                     y=ae_pivot[column],
                                     marker_color=colors[i % len(colors)]
                                 ))
                             
                             fig.update_layout(
-                                title=f"{selected_product_line} MDR Breakdown {start_date.year} - {end_date.year}",
+                                title=f"{selected_product_line} MDR Breakdown ({start_date.year} - {end_date.year})",
                                 xaxis_title="Year",
                                 yaxis_title="# MDRs",
                                 barmode='stack',
                                 height=400,
                                 xaxis={
-                                    'tickformat': 'd',  # Format years as integers without commas
-                                    'type': 'category'  # Treat years as categories to avoid duplicates
+                                    'type': 'category'  # Treat years as categories to avoid duplicates/decimals
                                 }
                             )
                             st.plotly_chart(fig, use_container_width=True)
@@ -586,8 +750,7 @@ else:
                             # Format YEAR column as integer without commas
                             ae_table['YEAR'] = ae_table['YEAR'].astype(int)
                             
-                            st.write(f"**Table 5: {selected_product_line} MDR Category Totals {start_date.year} – {end_date.year}**")
-                            # Use custom formatting to display years without commas
+                            st.write(f"**Table 5: {selected_product_line} MDR Category Totals ({start_date.year} – {end_date.year})**")
                             st.dataframe(ae_table.style.format({'YEAR': '{:.0f}'}))
                         else:
                             st.info("No adverse events data found for the selected criteria.")
@@ -639,8 +802,9 @@ else:
                                     marker_color=colors[i % len(colors)]
                                 ))
                             
+                            # CHANGE 4: Use LAST_FULL_YEAR instead of current year
                             fig.update_layout(
-                                title=f"{selected_product_line} Adverse Events by Country - {end_date.year} (Top 10)",
+                                title=f"{selected_product_line} Adverse Events by Country - {LAST_FULL_YEAR} (Top 10)",
                                 xaxis_title="Country",
                                 yaxis_title="Events",
                                 barmode='stack',
@@ -649,7 +813,7 @@ else:
                             )
                             st.plotly_chart(fig, use_container_width=True)
                             
-                            st.write(f"**Figure 2: {selected_product_line} Adverse Event (MDR) Breakdown by Country ({end_date.year})**")
+                            st.write(f"**Figure 2: {selected_product_line} Adverse Event (MDR) Breakdown by Country ({LAST_FULL_YEAR})**")
                             
                             # Display table
                             ae_country_table = ae_country_pivot.reset_index()
@@ -658,7 +822,9 @@ else:
                         else:
                             st.info("No adverse events by country data found for the selected criteria.")
                         
+                        # ================================================================
                         # 3. FIELD NOTICES / RECALLS
+                        # ================================================================
                         st.subheader("3. Field Notices / Recalls")
                         
                         recalls_query = f"""
@@ -679,17 +845,31 @@ else:
                             recalls_data = pd.read_sql(recalls_query, st.session_state['conn'])
                             
                             if not recalls_data.empty:
-                                st.write(f"**Table 7: {selected_product_line} Product Recalls {start_date.year} - {end_date.year}**")
+                                st.write(f"**Table 7: {selected_product_line} Product Recalls ({start_date.year} - {end_date.year})**")
                                 st.dataframe(recalls_data)
                                 
-                                # Create summary chart
+                                # CHANGE 3: Fix decimal years in recalls graph
                                 recalls_summary = recalls_data.groupby('Year_Initiated').size().reset_index(name='Count')
+                                # Ensure Year is integer
+                                recalls_summary['Year_Initiated'] = recalls_summary['Year_Initiated'].astype(int)
+                                
                                 fig = px.bar(
                                     recalls_summary,
                                     x='Year_Initiated',
                                     y='Count',
-                                    title=f"{selected_product_line} Recalls by Year",
+                                    title=f"{selected_product_line} Recalls by Year ({start_date.year} - {end_date.year})",
                                     labels={'Count': 'Number of Recalls', 'Year_Initiated': 'Year'}
+                                )
+                                # Force integer display on x-axis
+                                fig.update_layout(
+                                    xaxis={
+                                        'type': 'category',  # Treat as category to show each year once
+                                        'categoryorder': 'category ascending'
+                                    }
+                                )
+                                fig.update_traces(
+                                    text=recalls_summary['Count'],
+                                    textposition='outside'
                                 )
                                 st.plotly_chart(fig, use_container_width=True)
                             else:
@@ -697,15 +877,18 @@ else:
                         except Exception as e:
                             st.warning(f"Recalls table may not exist in the database: {str(e)}")
                         
+                        # ================================================================
                         # 4. CUSTOMER COMPLAINT / USER FEEDBACK REVIEW
+                        # ================================================================
                         st.subheader("4. Customer Complaint / User Feedback Review")
                         
-                        # Get current year
-                        current_year = datetime.datetime.now().year
-                        current_year_start = f"{current_year}-01-01"
-                        current_year_end = f"{current_year}-12-31"
+                        # CHANGE 6: Use last year in user's selected range, not current year
+                        # Calculate the last full year within the user's selected date range
+                        last_year_in_range = min(end_date.year, LAST_FULL_YEAR)
+                        last_year_start = f"{last_year_in_range}-01-01"
+                        last_year_end = f"{last_year_in_range}-12-31"
                         
-                        # Complaint Totals and Rates by Country (CURRENT YEAR ONLY)
+                        # Complaint Totals and Rates by Country (LAST FULL YEAR IN RANGE)
                         complaint_rates_query = f"""
                         WITH ComplaintData AS (
                             SELECT 
@@ -713,8 +896,8 @@ else:
                                 COUNT(*) as Complaint_Total
                             FROM ComplaintMerged c
                             WHERE c.Brand = '{selected_product_line}'
-                            AND c.CD_Date_Complaint_Entry >= '{current_year_start}'
-                            AND c.CD_Date_Complaint_Entry <= '{current_year_end}'
+                            AND c.CD_Date_Complaint_Entry >= '{last_year_start}'
+                            AND c.CD_Date_Complaint_Entry <= '{last_year_end}'
                             {f"AND c.Catalog_No = '{selected_catalog}'" if selected_catalog else ""}
                             {get_country_filter('c.CD_Complaint_Country', selected_countries)}
                             AND c.CD_Complaint_Country IS NOT NULL
@@ -727,8 +910,8 @@ else:
                             FROM Sales s
                             INNER JOIN MaterialReference m ON s.Material = m.MATNo
                             WHERE m.Brand = '{selected_product_line}'
-                            AND s.[Date] >= '{current_year_start}'
-                            AND s.[Date] <= '{current_year_end}'
+                            AND s.[Date] >= '{last_year_start}'
+                            AND s.[Date] <= '{last_year_end}'
                             {f"AND m.CATALOG = '{selected_catalog}'" if selected_catalog else ""}
                             {get_country_filter('s.Country_final_dest', selected_countries)}
                             AND m.SingleUse = 'Y'
@@ -751,16 +934,17 @@ else:
                         complaint_rates = pd.read_sql(complaint_rates_query, st.session_state['conn'])
                         
                         if not complaint_rates.empty:
-                            st.write(f"**Table 8: Complaint Totals and Complaint Rates by Country ({current_year})**")
+                            # CHANGE 6: Title now shows the correct year
+                            st.write(f"**Table 8: Complaint Totals and Complaint Rates by Country ({last_year_in_range})**")
                             st.dataframe(complaint_rates)
                             
-                            # Create visualization - Top 10 countries
+                            # CHANGE 7: Add date indication to graph title
                             complaint_rates_top10 = complaint_rates.nlargest(10, 'Complaint_Total')
                             fig = px.bar(
                                 complaint_rates_top10,
                                 x='Country',
                                 y='Complaint_Total',
-                                title=f"{selected_product_line} Complaints by Country (Top 10)",
+                                title=f"{selected_product_line} Complaints by Country - {last_year_in_range} (Top 10)",
                                 labels={'Complaint_Total': 'Number of Complaints'}
                             )
                             fig.update_layout(xaxis_tickangle=-45)
@@ -814,31 +998,30 @@ else:
                             # Format Year_Occurrence as integer without commas
                             complaint_rates_by_year['Year_Occurrence'] = complaint_rates_by_year['Year_Occurrence'].astype(int)
                             
-                            st.write(f"**Table 9: Complaint Rates {start_date.year} – {end_date.year}**")
-                            # Use custom formatting to display years without commas
+                            st.write(f"**Table 9: Complaint Rates ({start_date.year} – {end_date.year})**")
                             st.dataframe(complaint_rates_by_year.style.format({'Year_Occurrence': '{:.0f}'}))
                             
-                            # Create trend chart
-                            # Convert Year_Occurrence to string to avoid duplicate labels
-                            complaint_rates_by_year['Year_Occurrence_Str'] = complaint_rates_by_year['Year_Occurrence'].astype(int).astype(str)
+                            # Create trend chart - use string for x-axis to avoid decimal years
+                            complaint_rates_by_year['Year_Occurrence_Str'] = complaint_rates_by_year['Year_Occurrence'].astype(str)
                             
                             fig = px.line(
                                 complaint_rates_by_year,
                                 x='Year_Occurrence_Str',
                                 y='Complaint_Total',
-                                title=f"{selected_product_line} Complaint Trends Over Time",
-                                labels={'Complaint_Total': 'Number of Complaints', 'Year_Occurrence_Str': 'Year'}
+                                title=f"{selected_product_line} Complaint Trends ({start_date.year} - {end_date.year})",
+                                labels={'Complaint_Total': 'Number of Complaints', 'Year_Occurrence_Str': 'Year'},
+                                markers=True
                             )
                             fig.update_layout(
-                                xaxis={
-                                    'type': 'category'  # Treat years as categories to show each year once
-                                }
+                                xaxis={'type': 'category'}
                             )
                             st.plotly_chart(fig, use_container_width=True)
                         else:
                             st.info("No complaint rates by year data found for the selected criteria.")
                         
+                        # ================================================================
                         # 5. COMPLAINTS PER FINAL OBJECT CODE
+                        # ================================================================
                         st.subheader("5. Complaints per Final Object Code")
                         
                         complaints_by_object_code_query = f"""
@@ -860,6 +1043,9 @@ else:
                         complaints_by_object_code = pd.read_sql(complaints_by_object_code_query, st.session_state['conn'])
                         
                         if not complaints_by_object_code.empty:
+                            # Ensure Year is integer
+                            complaints_by_object_code['Year'] = complaints_by_object_code['Year'].astype(int)
+                            
                             # Create pivot table
                             object_code_pivot = complaints_by_object_code.pivot_table(
                                 index='Object_Code',
@@ -878,14 +1064,14 @@ else:
                             
                             for i, year in enumerate(sorted(object_code_pivot_top10.columns)):
                                 fig.add_trace(go.Bar(
-                                    name=str(year),
+                                    name=str(int(year)),  # Ensure year is displayed as integer
                                     x=object_code_pivot_top10.index,
                                     y=object_code_pivot_top10[year],
                                     marker_color=colors[i % len(colors)]
                                 ))
                             
                             fig.update_layout(
-                                title=f"{selected_product_line} Complaints per Final Object Code (Top 10)",
+                                title=f"{selected_product_line} Complaints per Final Object Code ({start_date.year} - {end_date.year}) - Top 10",
                                 xaxis_title="Final Object Code",
                                 yaxis_title="Complaint Count",
                                 barmode='group',
@@ -895,7 +1081,7 @@ else:
                             )
                             st.plotly_chart(fig, use_container_width=True)
                             
-                            st.write(f"**Figure 3: {selected_product_line} Complaints per Final Object Code {start_date.year} - {end_date.year}**")
+                            st.write(f"**Figure 3: {selected_product_line} Complaints per Final Object Code ({start_date.year} - {end_date.year})**")
                             
                             # Display table
                             object_code_table = object_code_pivot.reset_index()
@@ -904,14 +1090,18 @@ else:
                         else:
                             st.info("No complaints by object code data found for the selected criteria.")
                         
-                        # Create download section for complete report
+                        # ================================================================
+                        # DOWNLOAD SECTION
+                        # ================================================================
                         st.subheader("📋 Download Complete Report")
                         
                         # Prepare all data for Excel export
                         report_data = {}
                         
                         if not sales_by_country.empty:
-                            report_data['Sales by Country'] = sales_pivot if 'sales_pivot' in locals() else sales_by_country
+                            report_data['Sales by Country'] = sales_pivot_country if 'sales_pivot_country' in locals() else sales_by_country
+                            if 'sales_pivot_region' in locals():
+                                report_data['Sales by Region'] = sales_pivot_region
                         if not adverse_events.empty:
                             report_data['Adverse Events by Year'] = ae_table if 'ae_table' in locals() else adverse_events
                         if not ae_by_country.empty:
@@ -935,13 +1125,15 @@ else:
                                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                                     # Write summary sheet
                                     summary_data = {
-                                        'Parameter': ['Product Line', 'Start Date', 'End Date', 'Catalog', 'Countries'],
+                                        'Parameter': ['Product Line', 'Start Date', 'End Date', 'Catalog', 'Countries', 'Last Full Year', 'Current Year'],
                                         'Value': [
                                             selected_product_line,
                                             start_date_str,
                                             end_date_str, 
                                             selected_catalog if selected_catalog else 'All',
-                                            ', '.join(selected_countries) if selected_countries else 'All'
+                                            ', '.join(selected_countries) if selected_countries else 'All',
+                                            str(LAST_FULL_YEAR),
+                                            str(CURRENT_YEAR)
                                         ]
                                     }
                                     pd.DataFrame(summary_data).to_excel(writer, sheet_name='Report Parameters', index=False)
@@ -980,7 +1172,7 @@ else:
                         
                         with col3:
                             total_complaints = complaint_rates['Complaint_Total'].sum() if not complaint_rates.empty else 0
-                            st.metric("Total Complaints", total_complaints)
+                            st.metric(f"Total Complaints ({last_year_in_range})", total_complaints)
                         
                         with col4:
                             total_recalls = len(recalls_data) if 'recalls_data' in locals() and not recalls_data.empty else 0
@@ -1406,7 +1598,12 @@ else:
                     risk_data['P1_Formatted'] = risk_data['P1'].apply(lambda x: f"{x:.2e}" if x > 0 else "0.00e+00")
                     
                     # Create HHI-Hazard-Severity column
-                    risk_data['HHI-Hazard-Severity'] = hhi_value + risk_data['Hazard'].astype(str) + risk_data['Severity'].astype(str)
+                    # Handle case where hhi_value is None (for products not in HHI_Lookup table)
+                    hhi_str = hhi_value if hhi_value else ""
+                    # Also handle potential None/NaN values in Hazard and Severity columns
+                    risk_data['Hazard'] = risk_data['Hazard'].fillna('Unknown')
+                    risk_data['Severity'] = risk_data['Severity'].fillna('Unknown')
+                    risk_data['HHI-Hazard-Severity'] = hhi_str + risk_data['Hazard'].astype(str) + risk_data['Severity'].astype(str)
                     
                     # Get P2 values from lookup table
                     unique_hhi_hazard_severity = risk_data['HHI-Hazard-Severity'].unique().tolist()
@@ -1513,6 +1710,10 @@ else:
         st.write(f"**Server:** ph-radc-server-eastus.database.windows.net")
         st.write(f"**Database:** azure-db-radcommercial")
         
+        st.write("### Configuration")
+        st.write(f"📅 Last Full Year: **{LAST_FULL_YEAR}**")
+        st.write(f"📅 Current Year: **{CURRENT_YEAR}**")
+        
         st.write("### Available Tables")
         try:
             tables_df = get_tables()
@@ -1524,7 +1725,8 @@ else:
             st.write("Unable to retrieve table list")
         
         st.write("### Report Features")
-        st.write("✅ Sales Analysis")
+        st.write("✅ Sales by Country (Chart 1)")
+        st.write("✅ Sales by Region (Chart 2)")
         st.write("✅ Adverse Events")
         st.write("✅ Field Notices/Recalls")
         st.write("✅ Complaint Analysis")
@@ -1534,4 +1736,4 @@ else:
         if st.button("🔓 Logout", type="secondary"):
             st.session_state['logged_in'] = False
             st.session_state['conn'] = None
-            st.experimental_rerun()
+            st.rerun()

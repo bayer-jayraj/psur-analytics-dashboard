@@ -567,75 +567,131 @@ else:
                         # ================================================================
                         st.subheader("1. Sales Analysis")
                         
-                        # CHANGE 1 & 2: Query for Sales with Product Type (Disposable vs Injector)
-                        sales_query = f"""
+                        # FIX TC.2.1.2/TC2.1.3: Calculate the last year in the user's selected range
+                        # For Chart 1 (Sales by Country), show only the LAST year of the range
+                        last_year_for_sales = end_date.year
+                        last_year_sales_start = f"{last_year_for_sales}-01-01"
+                        last_year_sales_end = f"{last_year_for_sales}-12-31"
+                        
+                        # FIX TC2.1.13: Use ROW_NUMBER() to get truly unique MATNo and avoid duplicate counting
+                        # The previous DISTINCT on multiple columns still caused duplicates when MATNo had different DisposableCategory values
+                        # Query for Sales by Country - LAST YEAR ONLY (FIX for TC.2.1.2/TC2.1.3)
+                        # Chart 1 should only show the last year in the date range the user inputs
+                        sales_by_country_query = f"""
+                        WITH RankedMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, DisposableCategory,
+                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY DisposableCategory) as rn
+                            FROM MaterialReference
+                            WHERE Brand = '{selected_product_line}'
+                            AND DisposableCategory IS NOT NULL
+                            {f"AND CATALOG = '{selected_catalog}'" if selected_catalog else ""}
+                        ),
+                        UniqueMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, DisposableCategory
+                            FROM RankedMatRef
+                            WHERE rn = 1
+                        )
                         SELECT 
                             s.Country_final_dest,
                             YEAR(s.[Date]) as SaleYear,
                             m.DisposableCategory as ProductType,
                             SUM(s.Quantity) as TotalQuantity
                         FROM Sales s
-                        LEFT JOIN MaterialReference m ON s.Material = m.MATNo
-                        WHERE (m.Brand = '{selected_product_line}' OR m.ProductGroup = '{selected_product_line}')
-                        AND s.[Date] >= '{start_date_str}'
-                        AND s.[Date] <= '{end_date_str}'
-                        {f"AND m.CATALOG = '{selected_catalog}'" if selected_catalog else ""}
+                        INNER JOIN UniqueMatRef m ON s.Material = m.MATNo
+                        WHERE YEAR(s.[Date]) = {last_year_for_sales}
                         {get_country_filter('s.Country_final_dest', selected_countries)}
-                        AND m.DisposableCategory IS NOT NULL
+                        GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.DisposableCategory
+                        """
+                        
+                        # FIX TC2.1.13: Query for comprehensive Sales data - ALL years in range (for Chart 2)
+                        # Use ROW_NUMBER() to get truly unique MATNo and avoid duplicate counting
+                        sales_query = f"""
+                        WITH RankedMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, DisposableCategory,
+                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY DisposableCategory) as rn
+                            FROM MaterialReference
+                            WHERE Brand = '{selected_product_line}'
+                            AND DisposableCategory IS NOT NULL
+                            {f"AND CATALOG = '{selected_catalog}'" if selected_catalog else ""}
+                        ),
+                        UniqueMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, DisposableCategory
+                            FROM RankedMatRef
+                            WHERE rn = 1
+                        )
+                        SELECT 
+                            s.Country_final_dest,
+                            YEAR(s.[Date]) as SaleYear,
+                            m.DisposableCategory as ProductType,
+                            SUM(s.Quantity) as TotalQuantity
+                        FROM Sales s
+                        INNER JOIN UniqueMatRef m ON s.Material = m.MATNo
+                        WHERE s.[Date] >= '{start_date_str}'
+                        AND s.[Date] <= '{end_date_str}'
+                        {get_country_filter('s.Country_final_dest', selected_countries)}
                         GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.DisposableCategory
                         """
                         
                         sales_by_country = pd.read_sql(sales_query, st.session_state['conn'])
                         
+                        # Execute the last year only query for Chart 1
+                        sales_last_year = pd.read_sql(sales_by_country_query, st.session_state['conn'])
+                        
                         if not sales_by_country.empty:
                             # ============================================================
-                            # CHART 1: Sales by Country with Product Type, Years as Columns
+                            # CHART 1: Sales by Country - LAST YEAR ONLY (FIX TC.2.1.2/TC2.1.3)
                             # ============================================================
                             st.write("### Chart 1: Sales by Country and Product Type")
-                            st.write(f"**Table 4a: {selected_product_line} Sales by Country ({start_date.year} - {end_date.year})**")
+                            st.write(f"**Table 4a: {selected_product_line} Sales by Country ({last_year_for_sales} Only)**")
+                            st.caption(f"*Showing sales data for the last year ({last_year_for_sales}) of the selected date range*")
                             
-                            # Create pivot table: Country + ProductType as rows, Years as columns
-                            sales_pivot_country = sales_by_country.pivot_table(
-                                index=['Country_final_dest', 'ProductType'],
-                                columns='SaleYear',
-                                values='TotalQuantity',
-                                fill_value=0,
-                                aggfunc='sum'
-                            ).reset_index()
-                            
-                            # Rename columns for clarity
-                            sales_pivot_country.columns.name = None
-                            
-                            # Format year columns as integers (no decimals)
-                            year_columns = [col for col in sales_pivot_country.columns if isinstance(col, (int, float)) and col > 2000]
-                            
-                            # Sort by country then product type
-                            sales_pivot_country = sales_pivot_country.sort_values(['Country_final_dest', 'ProductType'])
-                            
-                            # Display the table
-                            st.dataframe(sales_pivot_country.style.format(
-                                {col: '{:,.0f}' for col in year_columns}
-                            ), use_container_width=True)
-                            
-                            # Create grouped bar chart for Chart 1 (Top 10 countries)
-                            # Aggregate by country first
-                            country_totals = sales_by_country.groupby('Country_final_dest')['TotalQuantity'].sum().nlargest(10).index.tolist()
-                            chart1_data = sales_by_country[sales_by_country['Country_final_dest'].isin(country_totals)]
-                            
-                            fig1 = px.bar(
-                                chart1_data,
-                                x='Country_final_dest',
-                                y='TotalQuantity',
-                                color='ProductType',
-                                barmode='group',
-                                title=f"{selected_product_line} Sales by Country and Product Type ({start_date.year} - {end_date.year}) - Top 10",
-                                labels={'TotalQuantity': 'Total Quantity', 'Country_final_dest': 'Country', 'ProductType': 'Product Type'}
-                            )
-                            fig1.update_layout(xaxis_tickangle=-45)
-                            st.plotly_chart(fig1, use_container_width=True)
+                            if not sales_last_year.empty:
+                                # Create pivot table for last year only: Country + ProductType as rows
+                                sales_pivot_country = sales_last_year.pivot_table(
+                                    index=['Country_final_dest', 'ProductType'],
+                                    values='TotalQuantity',
+                                    fill_value=0,
+                                    aggfunc='sum'
+                                ).reset_index()
+                                
+                                # Rename columns for clarity
+                                sales_pivot_country.columns.name = None
+                                sales_pivot_country.columns = ['Country', 'ProductType', f'Sales_{last_year_for_sales}']
+                                
+                                # Sort by country then product type
+                                sales_pivot_country = sales_pivot_country.sort_values(['Country', 'ProductType'])
+                                
+                                # Display the table
+                                st.dataframe(sales_pivot_country.style.format(
+                                    {f'Sales_{last_year_for_sales}': '{:,.0f}'}
+                                ), use_container_width=True)
+                                
+                                # Create grouped bar chart for Chart 1 (Top 10 countries) - LAST YEAR ONLY
+                                # Aggregate by country first, sorted by total quantity descending
+                                country_totals = sales_last_year.groupby('Country_final_dest')['TotalQuantity'].sum().nlargest(10)
+                                # Get countries in descending order by total
+                                sorted_countries = country_totals.index.tolist()
+                                chart1_data = sales_last_year[sales_last_year['Country_final_dest'].isin(sorted_countries)]
+                                
+                                # Create categorical order for x-axis (descending by total)
+                                fig1 = px.bar(
+                                    chart1_data,
+                                    x='Country_final_dest',
+                                    y='TotalQuantity',
+                                    color='ProductType',
+                                    barmode='group',
+                                    title=f"{selected_product_line} Sales by Country and Product Type ({last_year_for_sales}) - Top 10",
+                                    labels={'TotalQuantity': 'Total Quantity', 'Country_final_dest': 'Country', 'ProductType': 'Product Type'},
+                                    category_orders={'Country_final_dest': sorted_countries}  # Sort descending by total
+                                )
+                                fig1.update_layout(xaxis_tickangle=-45)
+                                st.plotly_chart(fig1, use_container_width=True)
+                            else:
+                                st.info(f"No sales data found for {last_year_for_sales}.")
                             
                             # ============================================================
                             # CHART 2: Sales by Region (EEA_CH_TR, ROW, USA) with Product Type
+                            # Shows comprehensive sales across the full date range
                             # ============================================================
                             st.write("### Chart 2: Sales by Region and Product Type")
                             st.write(f"**Table 4b: {selected_product_line} Sales by Region ({start_date.year} - {end_date.year})**")
@@ -692,7 +748,8 @@ else:
                         # ================================================================
                         st.subheader("2. Adverse Events")
                         
-                        # Adverse Events by Type and Year
+                        # FIX TC2.1.4-TC2.1.7: Use YEAR column directly instead of converting dates
+                        # Also exclude "Non-incident, requested by NHA" per test case notes
                         adverse_events_query = f"""
                         SELECT 
                             Type_of_Incident,
@@ -700,11 +757,12 @@ else:
                             COUNT(*) as EventCount
                         FROM AdverseEventsData
                         WHERE Product_Line = '{selected_product_line}'
-                        AND TRY_CONVERT(datetime, Issue_Aware_Date) >= '{start_date_str}'
-                        AND TRY_CONVERT(datetime, Issue_Aware_Date) <= '{end_date_str}'
+                        AND YEAR >= {start_date.year}
+                        AND YEAR <= {end_date.year}
                         {f"AND Catalog = '{selected_catalog}'" if selected_catalog else ""}
                         {get_country_filter('COUNTRY_of_ORIGIN', selected_countries)}
                         AND Type_of_Incident IS NOT NULL
+                        AND Type_of_Incident NOT LIKE '%Non-incident%'
                         GROUP BY Type_of_Incident, YEAR
                         ORDER BY YEAR, Type_of_Incident
                         """
@@ -758,6 +816,7 @@ else:
                         # 2b. ADVERSE EVENTS BY COUNTRY  
                         st.subheader("2b. Adverse Events by Country")
                         
+                        # FIX TC2.1.4-TC2.1.7: Use YEAR column directly, exclude Non-incidents
                         ae_by_country_query = f"""
                         SELECT 
                             COUNTRY_of_ORIGIN,
@@ -765,12 +824,13 @@ else:
                             COUNT(*) as EventCount
                         FROM AdverseEventsData
                         WHERE Product_Line = '{selected_product_line}'
-                        AND TRY_CONVERT(datetime, Issue_Aware_Date) >= '{start_date_str}'
-                        AND TRY_CONVERT(datetime, Issue_Aware_Date) <= '{end_date_str}'
+                        AND YEAR >= {start_date.year}
+                        AND YEAR <= {end_date.year}
                         {f"AND Catalog = '{selected_catalog}'" if selected_catalog else ""}
                         {get_country_filter('COUNTRY_of_ORIGIN', selected_countries)}
                         AND COUNTRY_of_ORIGIN IS NOT NULL
                         AND Type_of_Incident IS NOT NULL
+                        AND Type_of_Incident NOT LIKE '%Non-incident%'
                         GROUP BY COUNTRY_of_ORIGIN, Type_of_Incident
                         ORDER BY COUNTRY_of_ORIGIN, Type_of_Incident
                         """
@@ -802,9 +862,10 @@ else:
                                     marker_color=colors[i % len(colors)]
                                 ))
                             
-                            # CHANGE 4: Use LAST_FULL_YEAR instead of current year
+                            # FIX TC2.1.6: Title must match actual query date range, not LAST_FULL_YEAR
+                            year_range_display = f"{start_date.year}-{end_date.year}" if start_date.year != end_date.year else str(start_date.year)
                             fig.update_layout(
-                                title=f"{selected_product_line} Adverse Events by Country - {LAST_FULL_YEAR} (Top 10)",
+                                title=f"{selected_product_line} Adverse Events by Country - {year_range_display} (Top 10)",
                                 xaxis_title="Country",
                                 yaxis_title="Events",
                                 barmode='stack',
@@ -813,7 +874,7 @@ else:
                             )
                             st.plotly_chart(fig, use_container_width=True)
                             
-                            st.write(f"**Figure 2: {selected_product_line} Adverse Event (MDR) Breakdown by Country ({LAST_FULL_YEAR})**")
+                            st.write(f"**Figure 2: {selected_product_line} Adverse Event (MDR) Breakdown by Country ({year_range_display})**")
                             
                             # Display table
                             ae_country_table = ae_country_pivot.reset_index()
@@ -882,15 +943,30 @@ else:
                         # ================================================================
                         st.subheader("4. Customer Complaint / User Feedback Review")
                         
-                        # CHANGE 6: Use last year in user's selected range, not current year
-                        # Calculate the last full year within the user's selected date range
-                        last_year_in_range = min(end_date.year, LAST_FULL_YEAR)
+                        # FIX TC2.1.9.3: Use the actual last year in user's selected range
+                        # Changed from min(end_date.year, LAST_FULL_YEAR) to just end_date.year
+                        # This ensures the table shows the year the user actually selected
+                        last_year_in_range = end_date.year
                         last_year_start = f"{last_year_in_range}-01-01"
                         last_year_end = f"{last_year_in_range}-12-31"
                         
                         # Complaint Totals and Rates by Country (LAST FULL YEAR IN RANGE)
+                        # FIX TC2.1.10: Use ROW_NUMBER() to get truly unique MATNo and avoid duplicate counting
                         complaint_rates_query = f"""
-                        WITH ComplaintData AS (
+                        WITH RankedMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, SingleUse,
+                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY CATALOG) as rn
+                            FROM MaterialReference
+                            WHERE Brand = '{selected_product_line}'
+                            AND SingleUse = 'Y'
+                            {f"AND CATALOG = '{selected_catalog}'" if selected_catalog else ""}
+                        ),
+                        UniqueMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, SingleUse
+                            FROM RankedMatRef
+                            WHERE rn = 1
+                        ),
+                        ComplaintData AS (
                             SELECT 
                                 c.CD_Complaint_Country as Country,
                                 COUNT(*) as Complaint_Total
@@ -908,13 +984,10 @@ else:
                                 s.Country_final_dest as Country,
                                 SUM(CAST(s.Quantity AS BIGINT)) as Estimated_Procedures
                             FROM Sales s
-                            INNER JOIN MaterialReference m ON s.Material = m.MATNo
-                            WHERE m.Brand = '{selected_product_line}'
-                            AND s.[Date] >= '{last_year_start}'
+                            INNER JOIN UniqueMatRef m ON s.Material = m.MATNo
+                            WHERE s.[Date] >= '{last_year_start}'
                             AND s.[Date] <= '{last_year_end}'
-                            {f"AND m.CATALOG = '{selected_catalog}'" if selected_catalog else ""}
                             {get_country_filter('s.Country_final_dest', selected_countries)}
-                            AND m.SingleUse = 'Y'
                             GROUP BY s.Country_final_dest
                         )
                         SELECT 
@@ -953,8 +1026,22 @@ else:
                             st.info("No complaint data found for the selected criteria.")
                         
                         # Complaint Rates by Year
+                        # FIX TC2.1.10: Use ROW_NUMBER() to get truly unique MATNo and avoid duplicate counting
                         complaint_rates_by_year_query = f"""
-                        WITH ComplaintsByYear AS (
+                        WITH RankedMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, SingleUse,
+                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY CATALOG) as rn
+                            FROM MaterialReference
+                            WHERE Brand = '{selected_product_line}'
+                            AND SingleUse = 'Y'
+                            {f"AND CATALOG = '{selected_catalog}'" if selected_catalog else ""}
+                        ),
+                        UniqueMatRef AS (
+                            SELECT MATNo, Brand, CATALOG, SingleUse
+                            FROM RankedMatRef
+                            WHERE rn = 1
+                        ),
+                        ComplaintsByYear AS (
                             SELECT 
                                 YEAR(c.CD_Date_Complaint_Entry) as Year_Occurrence,
                                 COUNT(*) as Complaint_Total
@@ -970,12 +1057,9 @@ else:
                                 YEAR(s.[Date]) as Year_Occurrence,
                                 SUM(CAST(s.Quantity AS BIGINT)) as Estimated_Procedures
                             FROM Sales s
-                            INNER JOIN MaterialReference m ON s.Material = m.MATNo
-                            WHERE m.Brand = '{selected_product_line}'
-                            AND s.[Date] >= '{start_date_str}'
+                            INNER JOIN UniqueMatRef m ON s.Material = m.MATNo
+                            WHERE s.[Date] >= '{start_date_str}'
                             AND s.[Date] <= '{end_date_str}'
-                            {f"AND m.CATALOG = '{selected_catalog}'" if selected_catalog else ""}
-                            AND m.SingleUse = 'Y'
                             GROUP BY YEAR(s.[Date])
                         )
                         SELECT 

@@ -172,7 +172,7 @@ def connect_to_azure_sql(username, password, server="ph-radc-server-eastus.datab
         st.info(f"Attempting to connect to server: {server}")
         
         # Create connection string with all options for maximum compatibility
-        conn_str = f"DRIVER={{ODBC Driver 13 for SQL Server}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
         
         # Attempt connection
         conn = pyodbc.connect(conn_str)

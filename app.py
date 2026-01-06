@@ -32,43 +32,76 @@ LAST_FULL_YEAR = 2024  # Hardcoded as per requirement
 CURRENT_YEAR = 2025    # Hardcoded as per requirement
 
 # ============================================================================
-# REGION MAPPING for Chart 2 (EEA_CH_TR, ROW, USA grouping)
+# REGION MAPPING for Chart 2 - Uses Sales_Country_Region_lookup.csv
+# Supports: EU, USA, ROW, China, UK regions
 # ============================================================================
-# EEA (European Economic Area) + Switzerland + Turkey
-EEA_CH_TR_COUNTRIES = [
-    # EU Member States
-    'Austria', 'Belgium', 'Bulgaria', 'Croatia', 'Cyprus', 'Czech Republic',
-    'Denmark', 'Estonia', 'Finland', 'France', 'Germany', 'Greece', 'Hungary',
-    'Ireland', 'Italy', 'Latvia', 'Lithuania', 'Luxembourg', 'Malta',
-    'Netherlands', 'Poland', 'Portugal', 'Romania', 'Slovakia', 'Slovenia',
-    'Spain', 'Sweden',
-    # EEA non-EU
-    'Iceland', 'Liechtenstein', 'Norway',
-    # Additional countries in this region
-    'Switzerland', 'Turkey',
-    # Common abbreviations and variations
-    'AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR',
-    'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK',
-    'SI', 'ES', 'SE', 'IS', 'LI', 'NO', 'CH', 'TR'
-]
+import os
 
-USA_COUNTRIES = [
-    'United States', 'USA', 'US', 'United States of America'
-]
+# Global variable to cache the region lookup
+_REGION_LOOKUP_CACHE = None
+
+def load_region_lookup():
+    """Load region lookup from CSV file and cache it"""
+    global _REGION_LOOKUP_CACHE
+    if _REGION_LOOKUP_CACHE is not None:
+        return _REGION_LOOKUP_CACHE
+    
+    try:
+        # Try to load from the csv file
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        lookup_path = os.path.join(script_dir, 'final csv files', 'Sales_Country_Region_lookup.csv')
+        
+        if os.path.exists(lookup_path):
+            lookup_df = pd.read_csv(lookup_path)
+            # Create dictionary mapping country to region
+            _REGION_LOOKUP_CACHE = dict(zip(lookup_df['Country'].str.strip(), lookup_df['Region'].str.strip()))
+        else:
+            # Fallback to hardcoded mapping if file not found
+            _REGION_LOOKUP_CACHE = {}
+    except Exception as e:
+        print(f"Warning: Could not load region lookup file: {e}")
+        _REGION_LOOKUP_CACHE = {}
+    
+    return _REGION_LOOKUP_CACHE
 
 def get_region(country):
-    """Map a country to its region (EEA_CH_TR, USA, or ROW)"""
+    """Map a country to its region using Sales_Country_Region_lookup.csv
+    Supports regions: EU, USA, ROW, China, UK
+    """
     if not country or pd.isna(country):
         return 'Unknown'
     
     country_str = str(country).strip()
     
-    if country_str in USA_COUNTRIES or country_str.upper() in ['US', 'USA']:
-        return 'USA'
-    elif country_str in EEA_CH_TR_COUNTRIES or country_str.upper() in [c.upper() for c in EEA_CH_TR_COUNTRIES]:
-        return 'EEA_CH_TR'
-    else:
-        return 'ROW'
+    # Load the lookup table
+    region_lookup = load_region_lookup()
+    
+    # Direct lookup first
+    if country_str in region_lookup:
+        return region_lookup[country_str]
+    
+    # Try case-insensitive matching
+    for lookup_country, region in region_lookup.items():
+        if lookup_country.lower() == country_str.lower():
+            return region
+    
+    # Fallback mappings for common variations not in lookup file
+    fallback_mappings = {
+        'United States': 'USA',
+        'United States of America': 'USA',
+        'US': 'USA',
+        'United Kingdom': 'UK',
+        'Great Britain': 'UK',
+        'Britain': 'UK',
+        'PR of China': 'China',
+        'People\'s Republic of China': 'China',
+    }
+    
+    if country_str in fallback_mappings:
+        return fallback_mappings[country_str]
+    
+    # Default to ROW if not found
+    return 'ROW'
 
 # Initialize session state
 if 'logged_in' not in st.session_state:
@@ -165,14 +198,44 @@ def standardize_country_name(country):
     # For other countries, capitalize properly
     return country.title()
 
+# Function to detect available ODBC drivers
+def get_available_odbc_driver():
+    """Try to find an available SQL Server ODBC driver"""
+    drivers_to_try = [
+        'ODBC Driver 18 for SQL Server',
+        'ODBC Driver 17 for SQL Server',
+        'ODBC Driver 13 for SQL Server',
+        'ODBC Driver 13.1 for SQL Server',
+        'SQL Server Native Client 11.0',
+        'SQL Server'
+    ]
+    
+    try:
+        available_drivers = pyodbc.drivers()
+        for driver in drivers_to_try:
+            if driver in available_drivers:
+                return driver
+    except:
+        pass
+    
+    return None
+
 # Function to connect to Azure SQL
 def connect_to_azure_sql(username, password, server="ph-radc-server-eastus.database.windows.net", database="azure-db-radcommercial"):
     try:
         # Log connection attempt
         st.info(f"Attempting to connect to server: {server}")
         
-        # Create connection string with all options for maximum compatibility
-        conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        # Auto-detect available ODBC driver
+        driver = get_available_odbc_driver()
+        if driver:
+            st.info(f"Using ODBC driver: {driver}")
+        else:
+            st.error("No SQL Server ODBC driver found. Please install ODBC Driver 17 or use pymssql connection method.")
+            return None
+        
+        # Create connection string with detected driver
+        conn_str = f"DRIVER={{{driver}}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
         
         # Attempt connection
         conn = pyodbc.connect(conn_str)
@@ -641,14 +704,17 @@ else:
                             # ============================================================
                             # CHART 1: Sales by Country - LAST YEAR ONLY (FIX TC.2.1.2/TC2.1.3)
                             # ============================================================
-                            st.write("### Chart 1: Sales by Country and Product Type")
+                            st.write("### Chart 1: Sales by Country and Product Group")
                             st.write(f"**Table 4a: {selected_product_line} Sales by Country ({last_year_for_sales} Only)**")
                             st.caption(f"*Showing sales data for the last year ({last_year_for_sales}) of the selected date range*")
                             
                             if not sales_last_year.empty:
-                                # Create pivot table for last year only: Country + ProductType as rows
-                                sales_pivot_country = sales_last_year.pivot_table(
-                                    index=['Country_final_dest', 'ProductType'],
+                                # Rename ProductType to ProductGroup for display
+                                sales_last_year_display = sales_last_year.rename(columns={'ProductType': 'ProductGroup'})
+                                
+                                # Create pivot table for last year only: Country + ProductGroup as rows
+                                sales_pivot_country = sales_last_year_display.pivot_table(
+                                    index=['Country_final_dest', 'ProductGroup'],
                                     values='TotalQuantity',
                                     fill_value=0,
                                     aggfunc='sum'
@@ -656,10 +722,10 @@ else:
                                 
                                 # Rename columns for clarity
                                 sales_pivot_country.columns.name = None
-                                sales_pivot_country.columns = ['Country', 'ProductType', f'Sales_{last_year_for_sales}']
+                                sales_pivot_country.columns = ['Country', 'ProductGroup', f'Sales_{last_year_for_sales}']
                                 
-                                # Sort by country then product type
-                                sales_pivot_country = sales_pivot_country.sort_values(['Country', 'ProductType'])
+                                # Sort by country then product group
+                                sales_pivot_country = sales_pivot_country.sort_values(['Country', 'ProductGroup'])
                                 
                                 # Display the table
                                 st.dataframe(sales_pivot_country.style.format(
@@ -668,20 +734,20 @@ else:
                                 
                                 # Create grouped bar chart for Chart 1 (Top 10 countries) - LAST YEAR ONLY
                                 # Aggregate by country first, sorted by total quantity descending
-                                country_totals = sales_last_year.groupby('Country_final_dest')['TotalQuantity'].sum().nlargest(10)
+                                country_totals = sales_last_year_display.groupby('Country_final_dest')['TotalQuantity'].sum().nlargest(10)
                                 # Get countries in descending order by total
                                 sorted_countries = country_totals.index.tolist()
-                                chart1_data = sales_last_year[sales_last_year['Country_final_dest'].isin(sorted_countries)]
+                                chart1_data = sales_last_year_display[sales_last_year_display['Country_final_dest'].isin(sorted_countries)]
                                 
                                 # Create categorical order for x-axis (descending by total)
                                 fig1 = px.bar(
                                     chart1_data,
                                     x='Country_final_dest',
                                     y='TotalQuantity',
-                                    color='ProductType',
+                                    color='ProductGroup',
                                     barmode='group',
-                                    title=f"{selected_product_line} Sales by Country and Product Type ({last_year_for_sales}) - Top 10",
-                                    labels={'TotalQuantity': 'Total Quantity', 'Country_final_dest': 'Country', 'ProductType': 'Product Type'},
+                                    title=f"{selected_product_line} Sales by Country and Product Group ({last_year_for_sales}) - Top 10",
+                                    labels={'TotalQuantity': 'Total Quantity', 'Country_final_dest': 'Country', 'ProductGroup': 'Product Group'},
                                     category_orders={'Country_final_dest': sorted_countries}  # Sort descending by total
                                 )
                                 fig1.update_layout(xaxis_tickangle=-45)
@@ -690,21 +756,24 @@ else:
                                 st.info(f"No sales data found for {last_year_for_sales}.")
                             
                             # ============================================================
-                            # CHART 2: Sales by Region (EEA_CH_TR, ROW, USA) with Product Type
+                            # CHART 2: Sales by Region (EU, USA, ROW, China, UK) with Product Group
                             # Shows comprehensive sales across the full date range
                             # ============================================================
-                            st.write("### Chart 2: Sales by Region and Product Type")
+                            st.write("### Chart 2: Sales by Region and Product Group")
                             st.write(f"**Table 4b: {selected_product_line} Sales by Region ({start_date.year} - {end_date.year})**")
                             
-                            # Add region column
+                            # Add region column using lookup file
                             sales_by_country['Region'] = sales_by_country['Country_final_dest'].apply(get_region)
                             
-                            # Aggregate by Region, ProductType, and Year
-                            sales_by_region = sales_by_country.groupby(['Region', 'ProductType', 'SaleYear'])['TotalQuantity'].sum().reset_index()
+                            # Rename ProductType to ProductGroup for display
+                            sales_by_country_display = sales_by_country.rename(columns={'ProductType': 'ProductGroup'})
                             
-                            # Create pivot table: Region + ProductType as rows, Years as columns
+                            # Aggregate by Region, ProductGroup, and Year
+                            sales_by_region = sales_by_country_display.groupby(['Region', 'ProductGroup', 'SaleYear'])['TotalQuantity'].sum().reset_index()
+                            
+                            # Create pivot table: Region + ProductGroup as rows, Years as columns
                             sales_pivot_region = sales_by_region.pivot_table(
-                                index=['Region', 'ProductType'],
+                                index=['Region', 'ProductGroup'],
                                 columns='SaleYear',
                                 values='TotalQuantity',
                                 fill_value=0,
@@ -713,10 +782,10 @@ else:
                             
                             sales_pivot_region.columns.name = None
                             
-                            # Sort by region order (EEA_CH_TR, ROW, USA)
-                            region_order = {'EEA_CH_TR': 0, 'ROW': 1, 'USA': 2}
-                            sales_pivot_region['sort_key'] = sales_pivot_region['Region'].map(region_order)
-                            sales_pivot_region = sales_pivot_region.sort_values(['sort_key', 'ProductType']).drop('sort_key', axis=1)
+                            # Sort by region order (China, EU, ROW, UK, USA)
+                            region_order = {'China': 0, 'EU': 1, 'ROW': 2, 'UK': 3, 'USA': 4}
+                            sales_pivot_region['sort_key'] = sales_pivot_region['Region'].map(lambda x: region_order.get(x, 99))
+                            sales_pivot_region = sales_pivot_region.sort_values(['sort_key', 'ProductGroup']).drop('sort_key', axis=1)
                             
                             # Display the table
                             year_columns_region = [col for col in sales_pivot_region.columns if isinstance(col, (int, float)) and col > 2000]
@@ -729,16 +798,16 @@ else:
                                 sales_by_region,
                                 x='Region',
                                 y='TotalQuantity',
-                                color='ProductType',
+                                color='ProductGroup',
                                 barmode='group',
-                                title=f"{selected_product_line} Sales by Region and Product Type ({start_date.year} - {end_date.year})",
-                                labels={'TotalQuantity': 'Total Quantity', 'Region': 'Region', 'ProductType': 'Product Type'},
-                                category_orders={'Region': ['EEA_CH_TR', 'ROW', 'USA']}
+                                title=f"{selected_product_line} Sales by Region and Product Group ({start_date.year} - {end_date.year})",
+                                labels={'TotalQuantity': 'Total Quantity', 'Region': 'Region', 'ProductGroup': 'Product Group'},
+                                category_orders={'Region': ['China', 'EU', 'ROW', 'UK', 'USA']}
                             )
                             st.plotly_chart(fig2, use_container_width=True)
                             
                             # Add footnote explaining product categories
-                            st.caption("*Disposables category includes sales of syringes and high-pressure connector tubing. Injector category includes injector hardware units.")
+                            st.caption("*Product Group indicates the type of product: Syringe Kits, Disposables, or other categories as defined in Material Reference.*")
                             
                         else:
                             st.info("No sales data found for the selected criteria.")
@@ -943,15 +1012,35 @@ else:
                         # ================================================================
                         st.subheader("4. Customer Complaint / User Feedback Review")
                         
-                        # FIX TC2.1.9.3: Use the actual last year in user's selected range
-                        # Changed from min(end_date.year, LAST_FULL_YEAR) to just end_date.year
-                        # This ensures the table shows the year the user actually selected
+                        # FIX TC3.1.3: Add toggle to show complaint totals for full date range or last year only
+                        st.write("**Complaint Data View Options:**")
+                        complaint_date_option = st.radio(
+                            "Select date range for complaint totals:",
+                            ["Full Date Range", "Last Year Only"],
+                            horizontal=True,
+                            key="complaint_date_option",
+                            help="Full Date Range uses the entire selected period. Last Year Only uses only the final year of the range."
+                        )
+                        
+                        if complaint_date_option == "Full Date Range":
+                            # Use full date range
+                            complaint_start = start_date_str
+                            complaint_end = end_date_str
+                            complaint_period_label = f"{start_date.year} - {end_date.year}"
+                        else:
+                            # Use last year in range (original behavior)
+                            last_year_in_range = end_date.year
+                            complaint_start = f"{last_year_in_range}-01-01"
+                            complaint_end = f"{last_year_in_range}-12-31"
+                            complaint_period_label = str(last_year_in_range)
+                        
+                        # For procedure calculation, always use full date range for accurate rates
                         last_year_in_range = end_date.year
                         last_year_start = f"{last_year_in_range}-01-01"
                         last_year_end = f"{last_year_in_range}-12-31"
                         
-                        # Complaint Totals and Rates by Country (LAST FULL YEAR IN RANGE)
-                        # FIX TC2.1.10: Use ROW_NUMBER() to get truly unique MATNo and avoid duplicate counting
+                        # Complaint Totals and Rates by Country
+                        # FIX TC2.1.10 & TC3.1.3: Use ROW_NUMBER() to get truly unique MATNo and use selected date range
                         complaint_rates_query = f"""
                         WITH RankedMatRef AS (
                             SELECT MATNo, Brand, CATALOG, SingleUse,
@@ -972,8 +1061,8 @@ else:
                                 COUNT(*) as Complaint_Total
                             FROM ComplaintMerged c
                             WHERE c.Brand = '{selected_product_line}'
-                            AND c.CD_Date_Complaint_Entry >= '{last_year_start}'
-                            AND c.CD_Date_Complaint_Entry <= '{last_year_end}'
+                            AND c.CD_Date_Complaint_Entry >= '{complaint_start}'
+                            AND c.CD_Date_Complaint_Entry <= '{complaint_end}'
                             {f"AND c.Catalog_No = '{selected_catalog}'" if selected_catalog else ""}
                             {get_country_filter('c.CD_Complaint_Country', selected_countries)}
                             AND c.CD_Complaint_Country IS NOT NULL
@@ -985,8 +1074,8 @@ else:
                                 SUM(CAST(s.Quantity AS BIGINT)) as Estimated_Procedures
                             FROM Sales s
                             INNER JOIN UniqueMatRef m ON s.Material = m.MATNo
-                            WHERE s.[Date] >= '{last_year_start}'
-                            AND s.[Date] <= '{last_year_end}'
+                            WHERE s.[Date] >= '{complaint_start}'
+                            AND s.[Date] <= '{complaint_end}'
                             {get_country_filter('s.Country_final_dest', selected_countries)}
                             GROUP BY s.Country_final_dest
                         )
@@ -1007,17 +1096,17 @@ else:
                         complaint_rates = pd.read_sql(complaint_rates_query, st.session_state['conn'])
                         
                         if not complaint_rates.empty:
-                            # CHANGE 6: Title now shows the correct year
-                            st.write(f"**Table 8: Complaint Totals and Complaint Rates by Country ({last_year_in_range})**")
+                            # Title shows the correct date period
+                            st.write(f"**Table 8: Complaint Totals and Complaint Rates by Country ({complaint_period_label})**")
                             st.dataframe(complaint_rates)
                             
-                            # CHANGE 7: Add date indication to graph title
+                            # Chart with date indication
                             complaint_rates_top10 = complaint_rates.nlargest(10, 'Complaint_Total')
                             fig = px.bar(
                                 complaint_rates_top10,
                                 x='Country',
                                 y='Complaint_Total',
-                                title=f"{selected_product_line} Complaints by Country - {last_year_in_range} (Top 10)",
+                                title=f"{selected_product_line} Complaints by Country - {complaint_period_label} (Top 10)",
                                 labels={'Complaint_Total': 'Number of Complaints'}
                             )
                             fig.update_layout(xaxis_tickangle=-45)
@@ -1256,7 +1345,7 @@ else:
                         
                         with col3:
                             total_complaints = complaint_rates['Complaint_Total'].sum() if not complaint_rates.empty else 0
-                            st.metric(f"Total Complaints ({last_year_in_range})", total_complaints)
+                            st.metric(f"Total Complaints ({complaint_period_label})", total_complaints)
                         
                         with col4:
                             total_recalls = len(recalls_data) if 'recalls_data' in locals() and not recalls_data.empty else 0
@@ -1534,13 +1623,16 @@ else:
             
             return "High"
         
-        @st.cache_data
-        def get_total_procedures(product_line):
+        def get_total_procedures(product_line, start_date_str=None, end_date_str=None):
             """
-            Calculate total procedures across all years for the product line
-            Same logic as in PSUR report but aggregated across all time
+            Calculate total procedures for the product line within date range
+            If no dates provided, calculates across all time
             """
             try:
+                date_filter = ""
+                if start_date_str and end_date_str:
+                    date_filter = f"AND s.[Date] >= '{start_date_str}' AND s.[Date] <= '{end_date_str}'"
+                
                 query = f"""
                 SELECT 
                     SUM(CAST(s.Quantity AS BIGINT)) as Total_Procedures
@@ -1548,6 +1640,7 @@ else:
                 INNER JOIN MaterialReference m ON s.Material = m.MATNo
                 WHERE m.Brand = '{product_line}'
                 AND m.SingleUse = 'Y'
+                {date_filter}
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 if not df.empty and df['Total_Procedures'].iloc[0] is not None:
@@ -1637,8 +1730,11 @@ else:
             Select a product line and date range to view risk calculations.
             """)
         
+        # Add Calculate Risk button for explicit trigger
+        calculate_button = st.button("🔄 Calculate Risk Assessment", type="primary", key="calc_risk_btn")
+        
         # Calculate and display results
-        if selected_risk_product:
+        if selected_risk_product and calculate_button:
             st.subheader("Risk Assessment Results")
             
             # Convert dates to strings
@@ -1648,8 +1744,8 @@ else:
             # Get HHI value
             hhi_value = get_hhi_value(selected_risk_product)
             
-            # Get Total Procedures
-            total_procedures = get_total_procedures(selected_risk_product)
+            # Get Total Procedures - now filtered by date range
+            total_procedures = get_total_procedures(selected_risk_product, risk_start_date_str, risk_end_date_str)
             
             # Display summary metrics
             col1, col2, col3 = st.columns(3)
@@ -1683,11 +1779,16 @@ else:
                     
                     # Create HHI-Hazard-Severity column
                     # Handle case where hhi_value is None (for products not in HHI_Lookup table)
-                    hhi_str = hhi_value if hhi_value else ""
+                    hhi_str = str(hhi_value) if hhi_value is not None else ""
+                    
                     # Also handle potential None/NaN values in Hazard and Severity columns
-                    risk_data['Hazard'] = risk_data['Hazard'].fillna('Unknown')
-                    risk_data['Severity'] = risk_data['Severity'].fillna('Unknown')
-                    risk_data['HHI-Hazard-Severity'] = hhi_str + risk_data['Hazard'].astype(str) + risk_data['Severity'].astype(str)
+                    risk_data['Hazard'] = risk_data['Hazard'].fillna('Unknown').astype(str)
+                    risk_data['Severity'] = risk_data['Severity'].fillna('Unknown').astype(str)
+                    
+                    # Build HHI-Hazard-Severity key safely
+                    risk_data['HHI-Hazard-Severity'] = risk_data.apply(
+                        lambda row: f"{hhi_str}{row['Hazard']}{row['Severity']}", axis=1
+                    )
                     
                     # Get P2 values from lookup table
                     unique_hhi_hazard_severity = risk_data['HHI-Hazard-Severity'].unique().tolist()
@@ -1695,7 +1796,13 @@ else:
                     
                     # Map P2 values
                     risk_data['P2'] = risk_data['HHI-Hazard-Severity'].map(p2_lookup)
-                    risk_data['P2'] = risk_data['P2'].fillna('N/A')
+                    
+                    # Default to 'Likely' for Negligible severity when P2 is not found
+                    # Per requirement: "negligible should default to likely if no value is assigned"
+                    risk_data['P2'] = risk_data.apply(
+                        lambda row: 'Likely' if (pd.isna(row['P2']) or row['P2'] == 'N/A') and row['Severity'] == 'Negligible' 
+                        else (row['P2'] if pd.notna(row['P2']) else 'N/A'), axis=1
+                    )
                     
                     # Calculate Probability of Occurrence of harm
                     risk_data['Probability_of_Occurrence_of_harm'] = risk_data.apply(

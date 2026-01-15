@@ -1730,7 +1730,21 @@ else:
         def get_p1_classification(p1_numeric, product_line):
             """
             Classify P1 based on P1 numeric value and product line
-            Based on the frequency definitions mapping table
+            Based on the frequency definitions mapping table from Excel
+            
+            Arterion group (Value of Frequent: 1x10^-3):
+              - Frequent: > 10^-3
+              - Probable: > 10^-4 and <= 10^-3
+              - Occasional: > 10^-5 and <= 10^-4
+              - Remote: > 10^-6 and <= 10^-5
+              - Improbable: <= 10^-6
+            
+            Centargo group (Value of Frequent: 1x10^-4):
+              - Frequent: > 10^-4
+              - Probable: > 10^-5 and <= 10^-4
+              - Occasional: > 10^-6 and <= 10^-5
+              - Remote: > 10^-7 and <= 10^-6
+              - Improbable: <= 10^-7
             """
             # Product groupings and their P1 thresholds
             arterion_products = ['Arterion', 'Avanta', 'MRXP', 'ProVis', 'Salient', 'Vistron Plus']
@@ -1744,31 +1758,31 @@ else:
             is_centargo = any(prod in product_line for prod in centargo_products)
             
             if is_arterion:
-                # Arterion group thresholds
+                # Arterion group thresholds (Value of Frequent: 1x10^-3)
                 if p1_numeric > 1e-3:
                     return 'Frequent'
-                elif p1_numeric <= 1e-3 and p1_numeric > 1e-4:
+                elif p1_numeric > 1e-4:
                     return 'Probable'
-                elif p1_numeric <= 1e-4:
+                elif p1_numeric > 1e-5:
                     return 'Occasional'
-                elif p1_numeric <= 1e-5:
+                elif p1_numeric > 1e-6:
                     return 'Remote'
                 else:  # <= 10^-6
                     return 'Improbable'
             elif is_centargo:
-                # Centargo group thresholds
+                # Centargo group thresholds (Value of Frequent: 1x10^-4)
                 if p1_numeric > 1e-4:
                     return 'Frequent'
-                elif p1_numeric <= 1e-4 and p1_numeric > 1e-5:
+                elif p1_numeric > 1e-5:
                     return 'Probable'
-                elif p1_numeric <= 1e-5:
+                elif p1_numeric > 1e-6:
                     return 'Occasional'
-                elif p1_numeric <= 1e-6:
+                elif p1_numeric > 1e-7:
                     return 'Remote'
                 else:  # <= 10^-7
                     return 'Improbable'
             else:
-                # Default classification for other products
+                # Default classification for other products (use Centargo thresholds)
                 if p1_numeric > 1e-4:
                     return 'Frequent'
                 elif p1_numeric > 1e-5:
@@ -1781,28 +1795,67 @@ else:
                     return 'Improbable'
         
         @st.cache_data
-        def get_p2_lookup_values(hhi_hazard_severity_list):
+        def get_p2_lookup_values(product_line, hazard_severity_pairs):
             """
-            Get P2 values from HHI_P2_LOOKUP table for given HHI-Hazard-Severity combinations
+            Get P2 values from HHISummary table for given hazard-severity combinations
+            Uses HHI_Reference = product_line OR HHI code to match
+            
+            Product to HHI Reference mapping:
+            - Centargo uses 'Centargo' or 'CT'
+            - Arterion uses 'CV'
+            - etc.
+            
+            Args:
+                product_line: The product line (e.g., 'Centargo', 'Arterion')
+                hazard_severity_pairs: List of (hazard, severity) tuples
+            
+            Returns:
+                Dictionary mapping (hazard, severity) to P2 value
             """
             try:
-                if not hhi_hazard_severity_list or len(hhi_hazard_severity_list) == 0:
+                if not hazard_severity_pairs or len(hazard_severity_pairs) == 0:
                     return {}
                 
-                # Create a comma-separated list for SQL IN clause
-                values_str = "','".join(hhi_hazard_severity_list)
+                # Get HHI code for product
+                hhi_code = get_hhi_value(product_line)
                 
+                # Determine which HHI_Reference to query
+                # Some products use product name, others use HHI code
+                query_refs = []
+                if product_line:
+                    query_refs.append(product_line)
+                if hhi_code:
+                    query_refs.append(hhi_code)
+                
+                if not query_refs:
+                    return {}
+                
+                # Build query with all possible HHI_References
+                refs_str = "', '".join(query_refs)
                 query = f"""
                 SELECT 
-                    [HHI_Hazard_Severity],
-                    [P2_estimate]
-                FROM [dbo].[HHI_P2_LOOKUP]
-                WHERE [HHI_Hazard_Severity] IN ('{values_str}')
+                    [Devacom_Hazard] as Hazard,
+                    [Severity],
+                    [P2]
+                FROM [dbo].[HHISummary]
+                WHERE [HHI_Reference] IN ('{refs_str}')
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 
-                # Create dictionary mapping HHI_Hazard_Severity to P2_estimate
-                p2_dict = dict(zip(df['HHI_Hazard_Severity'], df['P2_estimate']))
+                # Create dictionary mapping (hazard, severity) to P2
+                p2_dict = {}
+                for _, row in df.iterrows():
+                    hazard = row['Hazard']
+                    severity = row['Severity']
+                    p2 = row['P2']
+                    if pd.notna(severity):
+                        # Store with actual hazard value
+                        if pd.notna(hazard):
+                            p2_dict[(hazard, severity)] = p2
+                        # Also store with None hazard for fallback matching
+                        if pd.isna(hazard) or hazard == '':
+                            p2_dict[(None, severity)] = p2
+                
                 return p2_dict
             except Exception as e:
                 st.warning(f"Error retrieving P2 values: {str(e)}")
@@ -1946,29 +1999,50 @@ else:
         @st.cache_data
         def get_risk_calculation_data(product_line, start_date_str, end_date_str):
             """
-            Get risk calculation data from Complaints_Risk_Calc table only
-            No join needed - all data is in this single table
+            Get risk calculation data from ComplaintMerged table
+            Maps TA_Final_Risk_Classification to Severity:
+              - Risk category I -> Catastrophic
+              - Risk category II -> Critical
+              - Risk category III -> Moderate
+              - Risk category IV -> Minor
+              - Risk category V -> Negligible
+            Uses TA_Final_error_code_RiskCodes as Hazard
             """
             try:
                 query = f"""
                 SELECT 
-                    [Final_object_code__FR_] as Object_Code,
-                    [Final_error_code__FR_] as Error_code,
-                    [Final_error_subcode__FR_] as Error_Subcode,
-                    [Final_error_code__FR____Hazard] as Hazard,
-                    [Severity],
+                    TA_Final_object_code_QualityCode as Object_Code,
+                    TA_Final_error_code_QualityCode as Error_code,
+                    TA_Final_error_subcode_QualityCode as Error_Subcode,
+                    TA_Final_error_code_RiskCodes as Hazard,
+                    CASE 
+                        WHEN TA_Final_Risk_Classification = 'Risk category I' THEN 'Catastrophic'
+                        WHEN TA_Final_Risk_Classification = 'Risk category II' THEN 'Critical'
+                        WHEN TA_Final_Risk_Classification = 'Risk category III' THEN 'Moderate'
+                        WHEN TA_Final_Risk_Classification = 'Risk category IV' THEN 'Minor'
+                        WHEN TA_Final_Risk_Classification = 'Risk category V' THEN 'Negligible'
+                        ELSE TA_Final_Risk_Classification
+                    END as Severity,
                     COUNT(*) as Total_Complaints
-                FROM [dbo].[Complaints_Risk_Calc]
+                FROM [dbo].[ComplaintMerged]
                 WHERE [Brand] = '{product_line}'
-                AND [Complaint_Entry_Date] >= '{start_date_str}'
-                AND [Complaint_Entry_Date] <= '{end_date_str}'
+                AND [CD_Date_Complaint_Entry] >= '{start_date_str}'
+                AND [CD_Date_Complaint_Entry] <= '{end_date_str}'
                 GROUP BY 
-                    [Final_object_code__FR_],
-                    [Final_error_code__FR_],
-                    [Final_error_subcode__FR_],
-                    [Final_error_code__FR____Hazard],
-                    [Severity]
-                ORDER BY [Final_object_code__FR_], [Final_error_code__FR_], [Final_error_subcode__FR_], [Final_error_code__FR____Hazard]
+                    TA_Final_object_code_QualityCode,
+                    TA_Final_error_code_QualityCode,
+                    TA_Final_error_subcode_QualityCode,
+                    TA_Final_error_code_RiskCodes,
+                    CASE 
+                        WHEN TA_Final_Risk_Classification = 'Risk category I' THEN 'Catastrophic'
+                        WHEN TA_Final_Risk_Classification = 'Risk category II' THEN 'Critical'
+                        WHEN TA_Final_Risk_Classification = 'Risk category III' THEN 'Moderate'
+                        WHEN TA_Final_Risk_Classification = 'Risk category IV' THEN 'Minor'
+                        WHEN TA_Final_Risk_Classification = 'Risk category V' THEN 'Negligible'
+                        ELSE TA_Final_Risk_Classification
+                    END
+                ORDER BY TA_Final_object_code_QualityCode, TA_Final_error_code_QualityCode, 
+                         TA_Final_error_subcode_QualityCode, TA_Final_error_code_RiskCodes
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 return df
@@ -1997,16 +2071,16 @@ else:
                 key="risk_product_line"
             )
             
-            # Date selectors
+            # Date selectors - Default to 2022-01-01 to 2024-12-31 to match Excel validation
             today = datetime.datetime.now().date()
             risk_start_date = st.date_input(
                 "Start Date (Required)", 
-                value=datetime.date(2023, 10, 17),
+                value=datetime.date(2022, 1, 1),
                 key="risk_start_date"
             )
             risk_end_date = st.date_input(
                 "End Date (Required)", 
-                value=today,
+                value=datetime.date(2024, 12, 31),
                 key="risk_end_date"
             )
         
@@ -2070,32 +2144,53 @@ else:
                     # Format P1 as scientific notation
                     risk_data['P1_Formatted'] = risk_data['P1'].apply(lambda x: f"{x:.2e}" if x > 0 else "0.00e+00")
                     
-                    # Create HHI-Hazard-Severity column
+                    # Handle potential None/NaN values in Hazard and Severity columns
+                    risk_data['Hazard_Clean'] = risk_data['Hazard'].fillna('').astype(str)
+                    risk_data['Severity_Clean'] = risk_data['Severity'].fillna('').astype(str)
+                    
+                    # Create HHI-Hazard-Severity column for display
                     # Handle case where hhi_value is None (for products not in HHI_Lookup table)
                     hhi_str = str(hhi_value) if hhi_value is not None else ""
                     
-                    # Also handle potential None/NaN values in Hazard and Severity columns
-                    risk_data['Hazard'] = risk_data['Hazard'].fillna('Unknown').astype(str)
-                    risk_data['Severity'] = risk_data['Severity'].fillna('Unknown').astype(str)
-                    
                     # Build HHI-Hazard-Severity key safely
                     risk_data['HHI-Hazard-Severity'] = risk_data.apply(
-                        lambda row: f"{hhi_str}{row['Hazard']}{row['Severity']}", axis=1
+                        lambda row: f"{hhi_str}{row['Hazard_Clean']}{row['Severity_Clean']}", axis=1
                     )
                     
-                    # Get P2 values from lookup table
-                    unique_hhi_hazard_severity = risk_data['HHI-Hazard-Severity'].unique().tolist()
-                    p2_lookup = get_p2_lookup_values(unique_hhi_hazard_severity)
+                    # Get unique hazard-severity pairs for P2 lookup
+                    hazard_severity_pairs = list(set(
+                        zip(risk_data['Hazard_Clean'].tolist(), risk_data['Severity_Clean'].tolist())
+                    ))
                     
-                    # Map P2 values
-                    risk_data['P2'] = risk_data['HHI-Hazard-Severity'].map(p2_lookup)
+                    # Get P2 values from HHISummary table using new function
+                    p2_lookup = get_p2_lookup_values(selected_risk_product, hazard_severity_pairs)
                     
-                    # Default to 'Likely' for Negligible severity when P2 is not found
-                    # Per requirement: "negligible should default to likely if no value is assigned"
-                    risk_data['P2'] = risk_data.apply(
-                        lambda row: 'Likely' if (pd.isna(row['P2']) or row['P2'] == 'N/A') and row['Severity'] == 'Negligible' 
-                        else (row['P2'] if pd.notna(row['P2']) else 'N/A'), axis=1
-                    )
+                    # Map P2 values using (hazard, severity) tuple lookup
+                    def get_p2_for_row(row):
+                        hazard = row['Hazard_Clean']
+                        severity = row['Severity_Clean']
+                        
+                        # Try exact match first
+                        if (hazard, severity) in p2_lookup:
+                            return p2_lookup[(hazard, severity)]
+                        
+                        # Try with None hazard (for rows where hazard is empty/null)
+                        if (None, severity) in p2_lookup:
+                            return p2_lookup[(None, severity)]
+                        
+                        # Default values based on severity
+                        if severity == 'Negligible':
+                            return 'Likely'
+                        elif severity in ['Minor', 'Moderate', 'Critical', 'Catastrophic']:
+                            return 'N/A'
+                        
+                        return 'N/A'
+                    
+                    risk_data['P2'] = risk_data.apply(get_p2_for_row, axis=1)
+                    
+                    # Restore original Hazard and Severity columns (with NaN displayed properly)
+                    risk_data['Hazard'] = risk_data['Hazard'].replace('', pd.NA)
+                    risk_data['Severity'] = risk_data['Severity'].replace('', pd.NA)
                     
                     # Calculate Probability of Occurrence of harm
                     risk_data['Probability_of_Occurrence_of_harm'] = risk_data.apply(
@@ -2183,9 +2278,12 @@ else:
                     
                 else:
                     st.info(f"No risk calculation data found for {selected_risk_product}. This could mean:")
-                    st.write("- No complaints have been recorded for this product")
-                    st.write("- The product is not in the Complaints_Risk_Calc table")
-                    st.write("- There is a mismatch in product naming between tables")
+                    st.write("- No complaints have been recorded for this product in the selected date range")
+                    st.write("- The product is not in the ComplaintMerged table")
+                    st.write("- There is a mismatch in product naming between tables (Brand column)")
+                    st.write("")
+                    st.write("**Debug: Check if data exists with this query:**")
+                    st.code(f"SELECT COUNT(*) FROM ComplaintMerged WHERE Brand = '{selected_risk_product}' AND CD_Date_Complaint_Entry >= '{risk_start_date_str}' AND CD_Date_Complaint_Entry <= '{risk_end_date_str}'")
 
     # Sidebar with logout and connection info
     with st.sidebar:

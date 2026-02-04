@@ -1693,10 +1693,10 @@ else:
         @st.cache_data
         def get_hhi_value(product_line):
             try:
-                # Change 4: Fixed column name from HHI_Reference to [HHI Reference] (with space)
+                # Database column is HHI_Reference (with underscore), not HHI Reference (with space)
                 query = f"""
                 SELECT HHI FROM HHI_Lookup
-                WHERE [HHI Reference] = '{product_line}'
+                WHERE HHI_Reference = '{product_line}'
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 if not df.empty:

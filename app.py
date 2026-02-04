@@ -2275,7 +2275,24 @@ else:
                         'Probability_of_Occurrence_of_harm': 'Probability of Occurrence of harm'
                     })
                     
-                    st.dataframe(display_df, use_container_width=True)
+                    # Color code Risk_Level column
+                    def color_risk_level(val):
+                        if val == 'High':
+                            return 'background-color: #ff4444; color: white'  # Red
+                        elif val == 'Medium':
+                            return 'background-color: #ffcc00; color: black'  # Yellow
+                        elif val == 'Low':
+                            return 'background-color: #44aa44; color: white'  # Green
+                        else:
+                            return ''  # No color for N/A, blank, or other values
+                    
+                    # Apply styling to Risk_Level column
+                    styled_df = display_df.style.applymap(
+                        color_risk_level, 
+                        subset=['Risk_Level']
+                    )
+                    
+                    st.dataframe(styled_df, use_container_width=True)
                     
                     # Download button for risk assessment
                     try:

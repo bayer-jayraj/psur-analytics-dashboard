@@ -840,9 +840,10 @@ else:
                                 # Rename ProductType to ProductGroup for display
                                 sales_last_year_display = sales_last_year.rename(columns={'ProductType': 'ProductGroup'})
                                 
-                                # Create pivot table for last year only: Country + ProductGroup as rows
+                                # Create pivot table for last year only: ProductGroups as columns (Change 1)
                                 sales_pivot_country = sales_last_year_display.pivot_table(
-                                    index=['Country_final_dest', 'ProductGroup'],
+                                    index='Country_final_dest',
+                                    columns='ProductGroup',
                                     values='TotalQuantity',
                                     fill_value=0,
                                     aggfunc='sum'
@@ -850,14 +851,15 @@ else:
                                 
                                 # Rename columns for clarity
                                 sales_pivot_country.columns.name = None
-                                sales_pivot_country.columns = ['Country', 'ProductGroup', f'Sales_{last_year_for_sales}']
+                                sales_pivot_country = sales_pivot_country.rename(columns={'Country_final_dest': 'Country'})
                                 
-                                # Sort by country then product group
-                                sales_pivot_country = sales_pivot_country.sort_values(['Country', 'ProductGroup'])
+                                # Sort by country
+                                sales_pivot_country = sales_pivot_country.sort_values('Country')
                                 
-                                # Display the table
+                                # Display the table - format all numeric columns with thousand separators
+                                numeric_cols = [col for col in sales_pivot_country.columns if col != 'Country']
                                 st.dataframe(sales_pivot_country.style.format(
-                                    {f'Sales_{last_year_for_sales}': '{:,.0f}'}
+                                    {col: '{:,.0f}' for col in numeric_cols}
                                 ), use_container_width=True)
                                 
                                 # Create grouped bar chart for Chart 1 (Top 10 countries) - LAST YEAR ONLY
@@ -899,26 +901,28 @@ else:
                             # Aggregate by Region, ProductGroup, and Year
                             sales_by_region = sales_by_country_display.groupby(['Region', 'ProductGroup', 'SaleYear'])['TotalQuantity'].sum().reset_index()
                             
-                            # Create pivot table: Region + ProductGroup as rows, Years as columns
+                            # Create pivot table: Region as rows, Years as columns, with ProductGroup subtotals (Change 1)
+                            # First create a multi-index pivot with Region and Year, then ProductGroup as columns
                             sales_pivot_region = sales_by_region.pivot_table(
-                                index=['Region', 'ProductGroup'],
-                                columns='SaleYear',
+                                index='Region',
+                                columns=['ProductGroup', 'SaleYear'],
                                 values='TotalQuantity',
                                 fill_value=0,
                                 aggfunc='sum'
                             ).reset_index()
                             
-                            sales_pivot_region.columns.name = None
+                            # Flatten column multi-index for display
+                            sales_pivot_region.columns = [col[0] if col[1] == '' else f"{col[0]}_{col[1]}" for col in sales_pivot_region.columns]
                             
                             # Sort by region order (China, EU, ROW, UK, USA)
                             region_order = {'China': 0, 'EU': 1, 'ROW': 2, 'UK': 3, 'USA': 4}
                             sales_pivot_region['sort_key'] = sales_pivot_region['Region'].map(lambda x: region_order.get(x, 99))
-                            sales_pivot_region = sales_pivot_region.sort_values(['sort_key', 'ProductGroup']).drop('sort_key', axis=1)
+                            sales_pivot_region = sales_pivot_region.sort_values('sort_key').drop('sort_key', axis=1)
                             
-                            # Display the table
-                            year_columns_region = [col for col in sales_pivot_region.columns if isinstance(col, (int, float)) and col > 2000]
+                            # Display the table - format all numeric columns with thousand separators
+                            numeric_cols_region = [col for col in sales_pivot_region.columns if col != 'Region']
                             st.dataframe(sales_pivot_region.style.format(
-                                {col: '{:,.0f}' for col in year_columns_region}
+                                {col: '{:,.0f}' for col in numeric_cols_region}
                             ), use_container_width=True)
                             
                             # Create grouped bar chart for Chart 2
@@ -1305,7 +1309,12 @@ else:
                             complaint_rates_by_year['Year_Occurrence'] = complaint_rates_by_year['Year_Occurrence'].astype(int)
                             
                             st.write(f"**Table 9: Complaint Rates ({start_date.year} – {end_date.year})**")
-                            st.dataframe(complaint_rates_by_year.style.format({'Year_Occurrence': '{:.0f}'}))
+                            # Change 3: Add thousand separator to Complaint_Total and Estimated_Procedures
+                            st.dataframe(complaint_rates_by_year.style.format({
+                                'Year_Occurrence': '{:.0f}',
+                                'Complaint_Total': '{:,.0f}',
+                                'Estimated_Procedures': '{:,.0f}'
+                            }))
                             
                             # Create trend chart - use string for x-axis to avoid decimal years
                             complaint_rates_by_year['Year_Occurrence_Str'] = complaint_rates_by_year['Year_Occurrence'].astype(str)
@@ -1684,9 +1693,10 @@ else:
         @st.cache_data
         def get_hhi_value(product_line):
             try:
+                # Change 4: Fixed column name from HHI_Reference to [HHI Reference] (with space)
                 query = f"""
                 SELECT HHI FROM HHI_Lookup
-                WHERE HHI_Reference = '{product_line}'
+                WHERE [HHI Reference] = '{product_line}'
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 if not df.empty:
@@ -1917,6 +1927,7 @@ else:
         def get_risk_level(p1_prob, severity, prob_occurrence_harm):
             """
             Calculate Risk Level based on P1, Severity, and Probability of Occurrence of harm
+            Change 5: If P2 and/or Probability of Occurrence of harm are N/A, make Risk Level N/A
             """
             if p1_prob == "Error":
                 return "Error"
@@ -1925,6 +1936,9 @@ else:
             if severity == "NAHC":
                 return "N/A"
             if severity == "No Safety Impact":
+                return "N/A"
+            # Change 5: If Probability of Occurrence of harm is N/A, return N/A for Risk Level
+            if prob_occurrence_harm == "N/A" or pd.isna(prob_occurrence_harm) or prob_occurrence_harm == "":
                 return "N/A"
             
             # Negligible cases

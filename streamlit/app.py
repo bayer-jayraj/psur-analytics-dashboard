@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from io import BytesIO
 import numpy as np
 import importlib
+import time
 
 # Check if pymssql is available as an alternative
 try:
@@ -17,6 +18,12 @@ except ImportError:
 
 if pymssql_available:
     import pymssql
+
+# ============================================================================
+# CONNECTION RETRY CONFIGURATION
+# ============================================================================
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 2
 
 # Set page config
 st.set_page_config(
@@ -235,10 +242,24 @@ def connect_to_azure_sql(username, password, server="ph-radc-server-eastus.datab
             return None
         
         # Create connection string with detected driver
-        conn_str = f"DRIVER={{{driver}}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        # Increased Connection Timeout to 60 seconds and added Command Timeout
+        conn_str = f"DRIVER={{{driver}}};SERVER=tcp:{server},1433;DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
         
         # Attempt connection
-        conn = pyodbc.connect(conn_str)
+        conn = pyodbc.connect(conn_str, timeout=60)
+        # Set command timeout to 120 seconds for long-running queries
+        conn.timeout = 120
+        
+        # Store credentials for reconnection
+        st.session_state['db_credentials'] = {
+            'username': username,
+            'password': password,
+            'server': server,
+            'database': database,
+            'driver': driver,
+            'conn_str': conn_str
+        }
+        
         return conn
     except pyodbc.Error as e:
         st.error(f"ODBC Connection Error: {str(e)}")
@@ -254,6 +275,114 @@ def connect_to_azure_sql(username, password, server="ph-radc-server-eastus.datab
     except Exception as e:
         st.error(f"General Error: {str(e)}")
         return None
+
+# ============================================================================
+# ROBUST QUERY EXECUTION WITH RETRY LOGIC
+# ============================================================================
+def reconnect_to_database():
+    """Attempt to reconnect to the database using stored credentials"""
+    if 'db_credentials' not in st.session_state:
+        return None
+    
+    creds = st.session_state['db_credentials']
+    try:
+        conn = pyodbc.connect(creds['conn_str'], timeout=60)
+        conn.timeout = 120
+        st.session_state['conn'] = conn
+        return conn
+    except Exception as e:
+        st.warning(f"Reconnection attempt failed: {str(e)}")
+        return None
+
+def is_connection_alive(conn):
+    """Check if the database connection is still alive"""
+    if conn is None:
+        return False
+    try:
+        # Try a simple query to test connection
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        return True
+    except:
+        return False
+
+def execute_query_with_retry(query, conn=None, max_retries=MAX_RETRIES):
+    """
+    Execute a SQL query with automatic retry and reconnection logic.
+    Handles 'Communication link failure' and other transient errors.
+    
+    Args:
+        query: SQL query string to execute
+        conn: Database connection (uses session state if None)
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        pandas DataFrame with query results, or empty DataFrame on failure
+    """
+    if conn is None:
+        conn = st.session_state.get('conn')
+    
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Check if connection is alive, reconnect if needed
+            if not is_connection_alive(conn):
+                st.warning(f"Connection lost. Attempting to reconnect... (Attempt {attempt + 1}/{max_retries})")
+                conn = reconnect_to_database()
+                if conn is None:
+                    time.sleep(RETRY_DELAY_SECONDS * (attempt + 1))  # Exponential backoff
+                    continue
+            
+            # Execute the query
+            df = pd.read_sql(query, conn)
+            return df
+            
+        except (pyodbc.Error, Exception) as e:
+            last_error = e
+            error_str = str(e).lower()
+            
+            # Check for transient/recoverable errors
+            transient_errors = [
+                'communication link failure',
+                'connection was closed',
+                'connection is broken',
+                'login timeout',
+                'timeout expired',
+                'server is not responding',
+                '08s01',  # ODBC communication link failure code
+                '08003',  # Connection not open
+                '08007',  # Connection failure during transaction
+            ]
+            
+            is_transient = any(err in error_str for err in transient_errors)
+            
+            if is_transient and attempt < max_retries - 1:
+                wait_time = RETRY_DELAY_SECONDS * (attempt + 1)
+                st.warning(f"Database connection issue. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                
+                # Try to reconnect
+                conn = reconnect_to_database()
+            else:
+                # Non-transient error or last attempt
+                break
+    
+    # All retries failed
+    error_msg = f"Error executing query after {max_retries} attempts: {str(last_error)}"
+    st.error(error_msg)
+    
+    # Show debug info in expander
+    with st.expander("Debug Information"):
+        st.write(f"Selected product line: {st.session_state.get('selected_product_line', 'N/A')}")
+        if 'start_date' in st.session_state:
+            st.write(f"Date range: {st.session_state.get('start_date')} to {st.session_state.get('end_date')}")
+        st.write(f"Error details: {str(last_error)}")
+        st.code(query[:500] + "..." if len(query) > 500 else query, language="sql")
+    
+    return pd.DataFrame()
 
 # ============================================================================
 # DATA VALIDATION HELPER FUNCTIONS
@@ -637,68 +766,67 @@ else:
                         last_year_sales_end = f"{last_year_for_sales}-12-31"
                         
                         # FIX TC2.1.13: Use ROW_NUMBER() to get truly unique MATNo and avoid duplicate counting
-                        # The previous DISTINCT on multiple columns still caused duplicates when MATNo had different DisposableCategory values
+                        # The previous DISTINCT on multiple columns still caused duplicates when MATNo had different ProductGroup values
                         # Query for Sales by Country - LAST YEAR ONLY (FIX for TC.2.1.2/TC2.1.3)
                         # Chart 1 should only show the last year in the date range the user inputs
                         sales_by_country_query = f"""
                         WITH RankedMatRef AS (
-                            SELECT MATNo, Brand, CATALOG, DisposableCategory,
-                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY DisposableCategory) as rn
+                            SELECT MATNo, Brand, CATALOG, COALESCE(ProductGroup, 'Other') as ProductGroup,
+                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY ProductGroup) as rn
                             FROM MaterialReference
                             WHERE Brand = '{selected_product_line}'
-                            AND DisposableCategory IS NOT NULL
                             {f"AND CATALOG = '{selected_catalog}'" if selected_catalog else ""}
                         ),
                         UniqueMatRef AS (
-                            SELECT MATNo, Brand, CATALOG, DisposableCategory
+                            SELECT MATNo, Brand, CATALOG, ProductGroup
                             FROM RankedMatRef
                             WHERE rn = 1
                         )
                         SELECT 
                             s.Country_final_dest,
                             YEAR(s.[Date]) as SaleYear,
-                            m.DisposableCategory as ProductType,
+                            m.ProductGroup as ProductType,
                             SUM(s.Quantity) as TotalQuantity
                         FROM Sales s
                         INNER JOIN UniqueMatRef m ON s.Material = m.MATNo
                         WHERE YEAR(s.[Date]) = {last_year_for_sales}
                         {get_country_filter('s.Country_final_dest', selected_countries)}
-                        GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.DisposableCategory
+                        GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.ProductGroup
                         """
                         
                         # FIX TC2.1.13: Query for comprehensive Sales data - ALL years in range (for Chart 2)
                         # Use ROW_NUMBER() to get truly unique MATNo and avoid duplicate counting
                         sales_query = f"""
                         WITH RankedMatRef AS (
-                            SELECT MATNo, Brand, CATALOG, DisposableCategory,
-                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY DisposableCategory) as rn
+                            SELECT MATNo, Brand, CATALOG, COALESCE(ProductGroup, 'Other') as ProductGroup,
+                                   ROW_NUMBER() OVER (PARTITION BY MATNo ORDER BY ProductGroup) as rn
                             FROM MaterialReference
                             WHERE Brand = '{selected_product_line}'
-                            AND DisposableCategory IS NOT NULL
                             {f"AND CATALOG = '{selected_catalog}'" if selected_catalog else ""}
                         ),
                         UniqueMatRef AS (
-                            SELECT MATNo, Brand, CATALOG, DisposableCategory
+                            SELECT MATNo, Brand, CATALOG, ProductGroup
                             FROM RankedMatRef
                             WHERE rn = 1
                         )
                         SELECT 
                             s.Country_final_dest,
                             YEAR(s.[Date]) as SaleYear,
-                            m.DisposableCategory as ProductType,
+                            m.ProductGroup as ProductType,
                             SUM(s.Quantity) as TotalQuantity
                         FROM Sales s
                         INNER JOIN UniqueMatRef m ON s.Material = m.MATNo
                         WHERE s.[Date] >= '{start_date_str}'
                         AND s.[Date] <= '{end_date_str}'
                         {get_country_filter('s.Country_final_dest', selected_countries)}
-                        GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.DisposableCategory
+                        GROUP BY s.Country_final_dest, YEAR(s.[Date]), m.ProductGroup
                         """
                         
-                        sales_by_country = pd.read_sql(sales_query, st.session_state['conn'])
+                        # Use retry logic for Sales queries to handle connection issues
+                        sales_by_country = execute_query_with_retry(sales_query)
                         
                         # Execute the last year only query for Chart 1
-                        sales_last_year = pd.read_sql(sales_by_country_query, st.session_state['conn'])
+                        sales_last_year = execute_query_with_retry(sales_by_country_query)
                         
                         if not sales_by_country.empty:
                             # ============================================================
@@ -712,9 +840,10 @@ else:
                                 # Rename ProductType to ProductGroup for display
                                 sales_last_year_display = sales_last_year.rename(columns={'ProductType': 'ProductGroup'})
                                 
-                                # Create pivot table for last year only: Country + ProductGroup as rows
+                                # Create pivot table for last year only: ProductGroups as columns (Change 1)
                                 sales_pivot_country = sales_last_year_display.pivot_table(
-                                    index=['Country_final_dest', 'ProductGroup'],
+                                    index='Country_final_dest',
+                                    columns='ProductGroup',
                                     values='TotalQuantity',
                                     fill_value=0,
                                     aggfunc='sum'
@@ -722,14 +851,15 @@ else:
                                 
                                 # Rename columns for clarity
                                 sales_pivot_country.columns.name = None
-                                sales_pivot_country.columns = ['Country', 'ProductGroup', f'Sales_{last_year_for_sales}']
+                                sales_pivot_country = sales_pivot_country.rename(columns={'Country_final_dest': 'Country'})
                                 
-                                # Sort by country then product group
-                                sales_pivot_country = sales_pivot_country.sort_values(['Country', 'ProductGroup'])
+                                # Sort by country
+                                sales_pivot_country = sales_pivot_country.sort_values('Country')
                                 
-                                # Display the table
+                                # Display the table - format all numeric columns with thousand separators
+                                numeric_cols = [col for col in sales_pivot_country.columns if col != 'Country']
                                 st.dataframe(sales_pivot_country.style.format(
-                                    {f'Sales_{last_year_for_sales}': '{:,.0f}'}
+                                    {col: '{:,.0f}' for col in numeric_cols}
                                 ), use_container_width=True)
                                 
                                 # Create grouped bar chart for Chart 1 (Top 10 countries) - LAST YEAR ONLY
@@ -771,26 +901,28 @@ else:
                             # Aggregate by Region, ProductGroup, and Year
                             sales_by_region = sales_by_country_display.groupby(['Region', 'ProductGroup', 'SaleYear'])['TotalQuantity'].sum().reset_index()
                             
-                            # Create pivot table: Region + ProductGroup as rows, Years as columns
+                            # Create pivot table: Region as rows, Years as columns, with ProductGroup subtotals (Change 1)
+                            # First create a multi-index pivot with Region and Year, then ProductGroup as columns
                             sales_pivot_region = sales_by_region.pivot_table(
-                                index=['Region', 'ProductGroup'],
-                                columns='SaleYear',
+                                index='Region',
+                                columns=['ProductGroup', 'SaleYear'],
                                 values='TotalQuantity',
                                 fill_value=0,
                                 aggfunc='sum'
                             ).reset_index()
                             
-                            sales_pivot_region.columns.name = None
+                            # Flatten column multi-index for display
+                            sales_pivot_region.columns = [col[0] if col[1] == '' else f"{col[0]}_{col[1]}" for col in sales_pivot_region.columns]
                             
                             # Sort by region order (China, EU, ROW, UK, USA)
                             region_order = {'China': 0, 'EU': 1, 'ROW': 2, 'UK': 3, 'USA': 4}
                             sales_pivot_region['sort_key'] = sales_pivot_region['Region'].map(lambda x: region_order.get(x, 99))
-                            sales_pivot_region = sales_pivot_region.sort_values(['sort_key', 'ProductGroup']).drop('sort_key', axis=1)
+                            sales_pivot_region = sales_pivot_region.sort_values('sort_key').drop('sort_key', axis=1)
                             
-                            # Display the table
-                            year_columns_region = [col for col in sales_pivot_region.columns if isinstance(col, (int, float)) and col > 2000]
+                            # Display the table - format all numeric columns with thousand separators
+                            numeric_cols_region = [col for col in sales_pivot_region.columns if col != 'Region']
                             st.dataframe(sales_pivot_region.style.format(
-                                {col: '{:,.0f}' for col in year_columns_region}
+                                {col: '{:,.0f}' for col in numeric_cols_region}
                             ), use_container_width=True)
                             
                             # Create grouped bar chart for Chart 2
@@ -836,7 +968,8 @@ else:
                         ORDER BY YEAR, Type_of_Incident
                         """
                         
-                        adverse_events = pd.read_sql(adverse_events_query, st.session_state['conn'])
+                        # Use retry logic for Adverse Events query
+                        adverse_events = execute_query_with_retry(adverse_events_query)
                         
                         if not adverse_events.empty:
                             # Create pivot table for adverse events
@@ -904,7 +1037,8 @@ else:
                         ORDER BY COUNTRY_of_ORIGIN, Type_of_Incident
                         """
                         
-                        ae_by_country = pd.read_sql(ae_by_country_query, st.session_state['conn'])
+                        # Use retry logic for AE by country query
+                        ae_by_country = execute_query_with_retry(ae_by_country_query)
                         
                         if not ae_by_country.empty:
                             # Create pivot for country view
@@ -972,7 +1106,8 @@ else:
                         """
                         
                         try:
-                            recalls_data = pd.read_sql(recalls_query, st.session_state['conn'])
+                            # Use retry logic for recalls query
+                            recalls_data = execute_query_with_retry(recalls_query)
                             
                             if not recalls_data.empty:
                                 st.write(f"**Table 7: {selected_product_line} Product Recalls ({start_date.year} - {end_date.year})**")
@@ -1093,7 +1228,8 @@ else:
                         ORDER BY COALESCE(c.Complaint_Total, 0) DESC
                         """
                         
-                        complaint_rates = pd.read_sql(complaint_rates_query, st.session_state['conn'])
+                        # Use retry logic for complaint rates query
+                        complaint_rates = execute_query_with_retry(complaint_rates_query)
                         
                         if not complaint_rates.empty:
                             # Title shows the correct date period
@@ -1165,14 +1301,20 @@ else:
                         ORDER BY Year_Occurrence
                         """
                         
-                        complaint_rates_by_year = pd.read_sql(complaint_rates_by_year_query, st.session_state['conn'])
+                        # Use retry logic for complaint rates by year query
+                        complaint_rates_by_year = execute_query_with_retry(complaint_rates_by_year_query)
                         
                         if not complaint_rates_by_year.empty:
                             # Format Year_Occurrence as integer without commas
                             complaint_rates_by_year['Year_Occurrence'] = complaint_rates_by_year['Year_Occurrence'].astype(int)
                             
                             st.write(f"**Table 9: Complaint Rates ({start_date.year} – {end_date.year})**")
-                            st.dataframe(complaint_rates_by_year.style.format({'Year_Occurrence': '{:.0f}'}))
+                            # Change 3: Add thousand separator to Complaint_Total and Estimated_Procedures
+                            st.dataframe(complaint_rates_by_year.style.format({
+                                'Year_Occurrence': '{:.0f}',
+                                'Complaint_Total': '{:,.0f}',
+                                'Estimated_Procedures': '{:,.0f}'
+                            }))
                             
                             # Create trend chart - use string for x-axis to avoid decimal years
                             complaint_rates_by_year['Year_Occurrence_Str'] = complaint_rates_by_year['Year_Occurrence'].astype(str)
@@ -1213,7 +1355,8 @@ else:
                         ORDER BY Object_Code, Year
                         """
                         
-                        complaints_by_object_code = pd.read_sql(complaints_by_object_code_query, st.session_state['conn'])
+                        # Use retry logic for complaints by object code query
+                        complaints_by_object_code = execute_query_with_retry(complaints_by_object_code_query)
                         
                         if not complaints_by_object_code.empty:
                             # Ensure Year is integer
@@ -1262,6 +1405,166 @@ else:
                             st.dataframe(object_code_table)
                         else:
                             st.info("No complaints by object code data found for the selected criteria.")
+                        
+                        # ================================================================
+                        # 5. QIA ANALYSIS SECTION
+                        # ================================================================
+                        st.subheader("5. Quality Investigation Analysis (QIA)")
+                        
+                        # Query QIA data for the selected product line
+                        try:
+                            # Get QIA data grouped by type and year
+                            qia_query = f"""
+                            SELECT 
+                                QIA_CAPA as Type,
+                                Year,
+                                COUNT(*) as Count
+                            FROM QIAData
+                            WHERE ProductLine LIKE '%{selected_product_line}%'
+                            AND Year >= 2013 AND Year <= 2023
+                            GROUP BY QIA_CAPA, Year
+                            ORDER BY QIA_CAPA, Year
+                            """
+                            qia_data = execute_query_with_retry(qia_query)
+                            
+                            # Get RMDocType data for HRA, SEA, RM Memo, PSRA Reference
+                            rm_doc_query = f"""
+                            SELECT 
+                                RMDocType as Type,
+                                Year,
+                                COUNT(*) as Count
+                            FROM QIAData
+                            WHERE ProductLine LIKE '%{selected_product_line}%'
+                            AND Year >= 2013 AND Year <= 2023
+                            AND RMDocType IS NOT NULL
+                            AND RMDocType != 'N/A'
+                            GROUP BY RMDocType, Year
+                            ORDER BY RMDocType, Year
+                            """
+                            rm_doc_data = execute_query_with_retry(rm_doc_query)
+                            
+                            if not qia_data.empty or not rm_doc_data.empty:
+                                # Create Table 15: QI/CAPA & HRA/RM Memo Totals
+                                st.write(f"**Table 15: QI/CAPA & HRA/RM Memo Totals 2013 - 2023**")
+                                
+                                # Pivot QIA data for table display
+                                years = list(range(2013, 2024))
+                                qia_types = ['CAPA', 'QI', 'PA']
+                                rm_types = ['HRA', 'SEA', 'RM Memo', 'PSRA Reference']
+                                
+                                # Create the QIA pivot table
+                                if not qia_data.empty:
+                                    qia_pivot = qia_data.pivot_table(
+                                        index='Type',
+                                        columns='Year',
+                                        values='Count',
+                                        fill_value=0,
+                                        aggfunc='sum'
+                                    ).reset_index()
+                                    
+                                    # Ensure all years are present
+                                    for year in years:
+                                        if year not in qia_pivot.columns:
+                                            qia_pivot[year] = 0
+                                    
+                                    # Reorder columns
+                                    qia_pivot = qia_pivot[['Type'] + years]
+                                else:
+                                    qia_pivot = pd.DataFrame(columns=['Type'] + years)
+                                
+                                # Create the RM Doc pivot table
+                                if not rm_doc_data.empty:
+                                    rm_pivot = rm_doc_data.pivot_table(
+                                        index='Type',
+                                        columns='Year',
+                                        values='Count',
+                                        fill_value=0,
+                                        aggfunc='sum'
+                                    ).reset_index()
+                                    
+                                    # Ensure all years are present
+                                    for year in years:
+                                        if year not in rm_pivot.columns:
+                                            rm_pivot[year] = 0
+                                    
+                                    # Reorder columns
+                                    rm_pivot = rm_pivot[['Type'] + years]
+                                else:
+                                    rm_pivot = pd.DataFrame(columns=['Type'] + years)
+                                
+                                # Combine both tables
+                                combined_table = pd.concat([qia_pivot, rm_pivot], ignore_index=True)
+                                
+                                # Rename columns to display format
+                                year_columns = {year: str(year) for year in years}
+                                combined_table = combined_table.rename(columns=year_columns)
+                                combined_table = combined_table.rename(columns={'Type': selected_product_line})
+                                
+                                st.dataframe(combined_table, use_container_width=True)
+                                
+                                # Chart 1: QIA Breakdown (QI, CAPA, PA) - Stacked Bar Chart
+                                st.write(f"### {selected_product_line} QIA Breakdown 2013 - 2023")
+                                
+                                if not qia_data.empty:
+                                    # Filter for QI, CAPA, PA only
+                                    qia_chart_data = qia_data[qia_data['Type'].isin(['QI', 'CAPA', 'PA'])].copy()
+                                    
+                                    if not qia_chart_data.empty:
+                                        fig_qia = px.bar(
+                                            qia_chart_data,
+                                            x='Year',
+                                            y='Count',
+                                            color='Type',
+                                            barmode='stack',
+                                            title=f"{selected_product_line} QIA Breakdown 2013 - 2023",
+                                            labels={'Count': 'Count', 'Year': 'Year', 'Type': 'Type'},
+                                            color_discrete_map={'QI': '#4472C4', 'CAPA': '#C65911', 'PA': '#A9D18E'}
+                                        )
+                                        fig_qia.update_layout(
+                                            xaxis_tickangle=0,
+                                            xaxis=dict(tickmode='linear', dtick=1),
+                                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+                                        )
+                                        st.plotly_chart(fig_qia, use_container_width=True)
+                                    else:
+                                        st.info("No QI/CAPA/PA data available for the selected product line.")
+                                else:
+                                    st.info("No QIA data available for the selected product line.")
+                                
+                                # Chart 2: HRA/Memo/PSRA Breakdown - Stacked Bar Chart
+                                st.write(f"### {selected_product_line} HRA / Memo / PSRA Breakdown 2013 - 2023")
+                                
+                                if not rm_doc_data.empty:
+                                    fig_rm = px.bar(
+                                        rm_doc_data,
+                                        x='Year',
+                                        y='Count',
+                                        color='Type',
+                                        barmode='stack',
+                                        title=f"{selected_product_line} HRA / Memo / PSRA Breakdown 2013 - 2023",
+                                        labels={'Count': 'Count', 'Year': 'Year', 'Type': 'Type'},
+                                        color_discrete_map={
+                                            'HRA': '#4472C4', 
+                                            'SEA': '#C65911', 
+                                            'RM Memo': '#A9D18E',
+                                            'PSRA Reference': '#7030A0',
+                                            'PM Benefit-Risk Assessment': '#00B0F0'
+                                        }
+                                    )
+                                    fig_rm.update_layout(
+                                        xaxis_tickangle=0,
+                                        xaxis=dict(tickmode='linear', dtick=1),
+                                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
+                                    )
+                                    st.plotly_chart(fig_rm, use_container_width=True)
+                                else:
+                                    st.info("No HRA/Memo/PSRA data available for the selected product line.")
+                                    
+                            else:
+                                st.info(f"No QIA data found for {selected_product_line}.")
+                                
+                        except Exception as qia_error:
+                            st.warning(f"Unable to load QIA data: {str(qia_error)}")
                         
                         # ================================================================
                         # DOWNLOAD SECTION
@@ -1390,9 +1693,10 @@ else:
         @st.cache_data
         def get_hhi_value(product_line):
             try:
+                # Change 4: Fixed column name from HHI_Reference to [HHI Reference] (with space)
                 query = f"""
                 SELECT HHI FROM HHI_Lookup
-                WHERE HHI_Reference = '{product_line}'
+                WHERE [HHI Reference] = '{product_line}'
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 if not df.empty:
@@ -1436,7 +1740,21 @@ else:
         def get_p1_classification(p1_numeric, product_line):
             """
             Classify P1 based on P1 numeric value and product line
-            Based on the frequency definitions mapping table
+            Based on the frequency definitions mapping table from Excel
+            
+            Arterion group (Value of Frequent: 1x10^-3):
+              - Frequent: > 10^-3
+              - Probable: > 10^-4 and <= 10^-3
+              - Occasional: > 10^-5 and <= 10^-4
+              - Remote: > 10^-6 and <= 10^-5
+              - Improbable: <= 10^-6
+            
+            Centargo group (Value of Frequent: 1x10^-4):
+              - Frequent: > 10^-4
+              - Probable: > 10^-5 and <= 10^-4
+              - Occasional: > 10^-6 and <= 10^-5
+              - Remote: > 10^-7 and <= 10^-6
+              - Improbable: <= 10^-7
             """
             # Product groupings and their P1 thresholds
             arterion_products = ['Arterion', 'Avanta', 'MRXP', 'ProVis', 'Salient', 'Vistron Plus']
@@ -1450,31 +1768,31 @@ else:
             is_centargo = any(prod in product_line for prod in centargo_products)
             
             if is_arterion:
-                # Arterion group thresholds
+                # Arterion group thresholds (Value of Frequent: 1x10^-3)
                 if p1_numeric > 1e-3:
                     return 'Frequent'
-                elif p1_numeric <= 1e-3 and p1_numeric > 1e-4:
+                elif p1_numeric > 1e-4:
                     return 'Probable'
-                elif p1_numeric <= 1e-4:
+                elif p1_numeric > 1e-5:
                     return 'Occasional'
-                elif p1_numeric <= 1e-5:
+                elif p1_numeric > 1e-6:
                     return 'Remote'
                 else:  # <= 10^-6
                     return 'Improbable'
             elif is_centargo:
-                # Centargo group thresholds
+                # Centargo group thresholds (Value of Frequent: 1x10^-4)
                 if p1_numeric > 1e-4:
                     return 'Frequent'
-                elif p1_numeric <= 1e-4 and p1_numeric > 1e-5:
+                elif p1_numeric > 1e-5:
                     return 'Probable'
-                elif p1_numeric <= 1e-5:
+                elif p1_numeric > 1e-6:
                     return 'Occasional'
-                elif p1_numeric <= 1e-6:
+                elif p1_numeric > 1e-7:
                     return 'Remote'
                 else:  # <= 10^-7
                     return 'Improbable'
             else:
-                # Default classification for other products
+                # Default classification for other products (use Centargo thresholds)
                 if p1_numeric > 1e-4:
                     return 'Frequent'
                 elif p1_numeric > 1e-5:
@@ -1487,28 +1805,67 @@ else:
                     return 'Improbable'
         
         @st.cache_data
-        def get_p2_lookup_values(hhi_hazard_severity_list):
+        def get_p2_lookup_values(product_line, hazard_severity_pairs):
             """
-            Get P2 values from HHI_P2_LOOKUP table for given HHI-Hazard-Severity combinations
+            Get P2 values from HHISummary table for given hazard-severity combinations
+            Uses HHI_Reference = product_line OR HHI code to match
+            
+            Product to HHI Reference mapping:
+            - Centargo uses 'Centargo' or 'CT'
+            - Arterion uses 'CV'
+            - etc.
+            
+            Args:
+                product_line: The product line (e.g., 'Centargo', 'Arterion')
+                hazard_severity_pairs: List of (hazard, severity) tuples
+            
+            Returns:
+                Dictionary mapping (hazard, severity) to P2 value
             """
             try:
-                if not hhi_hazard_severity_list or len(hhi_hazard_severity_list) == 0:
+                if not hazard_severity_pairs or len(hazard_severity_pairs) == 0:
                     return {}
                 
-                # Create a comma-separated list for SQL IN clause
-                values_str = "','".join(hhi_hazard_severity_list)
+                # Get HHI code for product
+                hhi_code = get_hhi_value(product_line)
                 
+                # Determine which HHI_Reference to query
+                # Some products use product name, others use HHI code
+                query_refs = []
+                if product_line:
+                    query_refs.append(product_line)
+                if hhi_code:
+                    query_refs.append(hhi_code)
+                
+                if not query_refs:
+                    return {}
+                
+                # Build query with all possible HHI_References
+                refs_str = "', '".join(query_refs)
                 query = f"""
                 SELECT 
-                    [HHI_Hazard_Severity],
-                    [P2_estimate]
-                FROM [dbo].[HHI_P2_LOOKUP]
-                WHERE [HHI_Hazard_Severity] IN ('{values_str}')
+                    [Devacom_Hazard] as Hazard,
+                    [Severity],
+                    [P2]
+                FROM [dbo].[HHISummary]
+                WHERE [HHI_Reference] IN ('{refs_str}')
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 
-                # Create dictionary mapping HHI_Hazard_Severity to P2_estimate
-                p2_dict = dict(zip(df['HHI_Hazard_Severity'], df['P2_estimate']))
+                # Create dictionary mapping (hazard, severity) to P2
+                p2_dict = {}
+                for _, row in df.iterrows():
+                    hazard = row['Hazard']
+                    severity = row['Severity']
+                    p2 = row['P2']
+                    if pd.notna(severity):
+                        # Store with actual hazard value
+                        if pd.notna(hazard):
+                            p2_dict[(hazard, severity)] = p2
+                        # Also store with None hazard for fallback matching
+                        if pd.isna(hazard) or hazard == '':
+                            p2_dict[(None, severity)] = p2
+                
                 return p2_dict
             except Exception as e:
                 st.warning(f"Error retrieving P2 values: {str(e)}")
@@ -1570,6 +1927,7 @@ else:
         def get_risk_level(p1_prob, severity, prob_occurrence_harm):
             """
             Calculate Risk Level based on P1, Severity, and Probability of Occurrence of harm
+            Change 5: If P2 and/or Probability of Occurrence of harm are N/A, make Risk Level N/A
             """
             if p1_prob == "Error":
                 return "Error"
@@ -1578,6 +1936,9 @@ else:
             if severity == "NAHC":
                 return "N/A"
             if severity == "No Safety Impact":
+                return "N/A"
+            # Change 5: If Probability of Occurrence of harm is N/A, return N/A for Risk Level
+            if prob_occurrence_harm == "N/A" or pd.isna(prob_occurrence_harm) or prob_occurrence_harm == "":
                 return "N/A"
             
             # Negligible cases
@@ -1639,7 +2000,6 @@ else:
                 FROM Sales s
                 INNER JOIN MaterialReference m ON s.Material = m.MATNo
                 WHERE m.Brand = '{product_line}'
-                AND m.SingleUse = 'Y'
                 {date_filter}
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
@@ -1653,29 +2013,50 @@ else:
         @st.cache_data
         def get_risk_calculation_data(product_line, start_date_str, end_date_str):
             """
-            Get risk calculation data from Complaints_Risk_Calc table only
-            No join needed - all data is in this single table
+            Get risk calculation data from ComplaintMerged table
+            Maps TA_Final_Risk_Classification to Severity:
+              - Risk category I -> Catastrophic
+              - Risk category II -> Critical
+              - Risk category III -> Moderate
+              - Risk category IV -> Minor
+              - Risk category V -> Negligible
+            Uses TA_Final_error_code_RiskCodes as Hazard
             """
             try:
                 query = f"""
                 SELECT 
-                    [Final_object_code__FR_] as Object_Code,
-                    [Final_error_code__FR_] as Error_code,
-                    [Final_error_subcode__FR_] as Error_Subcode,
-                    [Final_error_code__FR____Hazard] as Hazard,
-                    [Severity],
+                    TA_Final_object_code_QualityCode as Object_Code,
+                    TA_Final_error_code_QualityCode as Error_code,
+                    TA_Final_error_subcode_QualityCode as Error_Subcode,
+                    TA_Final_error_code_RiskCodes as Hazard,
+                    CASE 
+                        WHEN TA_Final_Risk_Classification = 'Risk category I' THEN 'Catastrophic'
+                        WHEN TA_Final_Risk_Classification = 'Risk category II' THEN 'Critical'
+                        WHEN TA_Final_Risk_Classification = 'Risk category III' THEN 'Moderate'
+                        WHEN TA_Final_Risk_Classification = 'Risk category IV' THEN 'Minor'
+                        WHEN TA_Final_Risk_Classification = 'Risk category V' THEN 'Negligible'
+                        ELSE TA_Final_Risk_Classification
+                    END as Severity,
                     COUNT(*) as Total_Complaints
-                FROM [dbo].[Complaints_Risk_Calc]
+                FROM [dbo].[ComplaintMerged]
                 WHERE [Brand] = '{product_line}'
-                AND [Complaint_Entry_Date] >= '{start_date_str}'
-                AND [Complaint_Entry_Date] <= '{end_date_str}'
+                AND [CD_Date_Complaint_Entry] >= '{start_date_str}'
+                AND [CD_Date_Complaint_Entry] <= '{end_date_str}'
                 GROUP BY 
-                    [Final_object_code__FR_],
-                    [Final_error_code__FR_],
-                    [Final_error_subcode__FR_],
-                    [Final_error_code__FR____Hazard],
-                    [Severity]
-                ORDER BY Total_Complaints DESC
+                    TA_Final_object_code_QualityCode,
+                    TA_Final_error_code_QualityCode,
+                    TA_Final_error_subcode_QualityCode,
+                    TA_Final_error_code_RiskCodes,
+                    CASE 
+                        WHEN TA_Final_Risk_Classification = 'Risk category I' THEN 'Catastrophic'
+                        WHEN TA_Final_Risk_Classification = 'Risk category II' THEN 'Critical'
+                        WHEN TA_Final_Risk_Classification = 'Risk category III' THEN 'Moderate'
+                        WHEN TA_Final_Risk_Classification = 'Risk category IV' THEN 'Minor'
+                        WHEN TA_Final_Risk_Classification = 'Risk category V' THEN 'Negligible'
+                        ELSE TA_Final_Risk_Classification
+                    END
+                ORDER BY TA_Final_object_code_QualityCode, TA_Final_error_code_QualityCode, 
+                         TA_Final_error_subcode_QualityCode, TA_Final_error_code_RiskCodes
                 """
                 df = pd.read_sql(query, st.session_state['conn'])
                 return df
@@ -1704,16 +2085,16 @@ else:
                 key="risk_product_line"
             )
             
-            # Date selectors
+            # Date selectors - Default to 2022-01-01 to 2024-12-31 to match Excel validation
             today = datetime.datetime.now().date()
             risk_start_date = st.date_input(
                 "Start Date (Required)", 
-                value=datetime.date(2023, 10, 17),
+                value=datetime.date(2022, 1, 1),
                 key="risk_start_date"
             )
             risk_end_date = st.date_input(
                 "End Date (Required)", 
-                value=today,
+                value=datetime.date(2024, 12, 31),
                 key="risk_end_date"
             )
         
@@ -1777,32 +2158,53 @@ else:
                     # Format P1 as scientific notation
                     risk_data['P1_Formatted'] = risk_data['P1'].apply(lambda x: f"{x:.2e}" if x > 0 else "0.00e+00")
                     
-                    # Create HHI-Hazard-Severity column
+                    # Handle potential None/NaN values in Hazard and Severity columns
+                    risk_data['Hazard_Clean'] = risk_data['Hazard'].fillna('').astype(str)
+                    risk_data['Severity_Clean'] = risk_data['Severity'].fillna('').astype(str)
+                    
+                    # Create HHI-Hazard-Severity column for display
                     # Handle case where hhi_value is None (for products not in HHI_Lookup table)
                     hhi_str = str(hhi_value) if hhi_value is not None else ""
                     
-                    # Also handle potential None/NaN values in Hazard and Severity columns
-                    risk_data['Hazard'] = risk_data['Hazard'].fillna('Unknown').astype(str)
-                    risk_data['Severity'] = risk_data['Severity'].fillna('Unknown').astype(str)
-                    
                     # Build HHI-Hazard-Severity key safely
                     risk_data['HHI-Hazard-Severity'] = risk_data.apply(
-                        lambda row: f"{hhi_str}{row['Hazard']}{row['Severity']}", axis=1
+                        lambda row: f"{hhi_str}{row['Hazard_Clean']}{row['Severity_Clean']}", axis=1
                     )
                     
-                    # Get P2 values from lookup table
-                    unique_hhi_hazard_severity = risk_data['HHI-Hazard-Severity'].unique().tolist()
-                    p2_lookup = get_p2_lookup_values(unique_hhi_hazard_severity)
+                    # Get unique hazard-severity pairs for P2 lookup
+                    hazard_severity_pairs = list(set(
+                        zip(risk_data['Hazard_Clean'].tolist(), risk_data['Severity_Clean'].tolist())
+                    ))
                     
-                    # Map P2 values
-                    risk_data['P2'] = risk_data['HHI-Hazard-Severity'].map(p2_lookup)
+                    # Get P2 values from HHISummary table using new function
+                    p2_lookup = get_p2_lookup_values(selected_risk_product, hazard_severity_pairs)
                     
-                    # Default to 'Likely' for Negligible severity when P2 is not found
-                    # Per requirement: "negligible should default to likely if no value is assigned"
-                    risk_data['P2'] = risk_data.apply(
-                        lambda row: 'Likely' if (pd.isna(row['P2']) or row['P2'] == 'N/A') and row['Severity'] == 'Negligible' 
-                        else (row['P2'] if pd.notna(row['P2']) else 'N/A'), axis=1
-                    )
+                    # Map P2 values using (hazard, severity) tuple lookup
+                    def get_p2_for_row(row):
+                        hazard = row['Hazard_Clean']
+                        severity = row['Severity_Clean']
+                        
+                        # Try exact match first
+                        if (hazard, severity) in p2_lookup:
+                            return p2_lookup[(hazard, severity)]
+                        
+                        # Try with None hazard (for rows where hazard is empty/null)
+                        if (None, severity) in p2_lookup:
+                            return p2_lookup[(None, severity)]
+                        
+                        # Default values based on severity
+                        if severity == 'Negligible':
+                            return 'Likely'
+                        elif severity in ['Minor', 'Moderate', 'Critical', 'Catastrophic']:
+                            return 'N/A'
+                        
+                        return 'N/A'
+                    
+                    risk_data['P2'] = risk_data.apply(get_p2_for_row, axis=1)
+                    
+                    # Restore original Hazard and Severity columns (with NaN displayed properly)
+                    risk_data['Hazard'] = risk_data['Hazard'].replace('', pd.NA)
+                    risk_data['Severity'] = risk_data['Severity'].replace('', pd.NA)
                     
                     # Calculate Probability of Occurrence of harm
                     risk_data['Probability_of_Occurrence_of_harm'] = risk_data.apply(
@@ -1890,9 +2292,12 @@ else:
                     
                 else:
                     st.info(f"No risk calculation data found for {selected_risk_product}. This could mean:")
-                    st.write("- No complaints have been recorded for this product")
-                    st.write("- The product is not in the Complaints_Risk_Calc table")
-                    st.write("- There is a mismatch in product naming between tables")
+                    st.write("- No complaints have been recorded for this product in the selected date range")
+                    st.write("- The product is not in the ComplaintMerged table")
+                    st.write("- There is a mismatch in product naming between tables (Brand column)")
+                    st.write("")
+                    st.write("**Debug: Check if data exists with this query:**")
+                    st.code(f"SELECT COUNT(*) FROM ComplaintMerged WHERE Brand = '{selected_risk_product}' AND CD_Date_Complaint_Entry >= '{risk_start_date_str}' AND CD_Date_Complaint_Entry <= '{risk_end_date_str}'")
 
     # Sidebar with logout and connection info
     with st.sidebar:
@@ -1921,6 +2326,7 @@ else:
         st.write("✅ Adverse Events")
         st.write("✅ Field Notices/Recalls")
         st.write("✅ Complaint Analysis")
+        st.write("✅ QIA Analysis (Table 15)")
         st.write("✅ Interactive Visualizations")
         st.write("✅ Excel Export")
         

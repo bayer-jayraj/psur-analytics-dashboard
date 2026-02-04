@@ -2313,9 +2313,6 @@ else:
                     st.write("- No complaints have been recorded for this product in the selected date range")
                     st.write("- The product is not in the ComplaintMerged table")
                     st.write("- There is a mismatch in product naming between tables (Brand column)")
-                    st.write("")
-                    st.write("**Debug: Check if data exists with this query:**")
-                    st.code(f"SELECT COUNT(*) FROM ComplaintMerged WHERE Brand = '{selected_risk_product}' AND CD_Date_Complaint_Entry >= '{risk_start_date_str}' AND CD_Date_Complaint_Entry <= '{risk_end_date_str}'")
 
     # Sidebar with logout and connection info
     with st.sidebar:

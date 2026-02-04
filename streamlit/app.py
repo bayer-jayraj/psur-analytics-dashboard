@@ -39,7 +39,7 @@ LAST_FULL_YEAR = 2024  # Hardcoded as per requirement
 CURRENT_YEAR = 2025    # Hardcoded as per requirement
 
 # ============================================================================
-# REGION MAPPING for Chart 2 - Uses Sales_Country_Region_lookup.csv
+# REGION MAPPING for Chart 2 - Uses Sales_Country_Region_lookup table from database
 # Supports: EU, USA, ROW, China, UK regions
 # ============================================================================
 import os
@@ -48,31 +48,29 @@ import os
 _REGION_LOOKUP_CACHE = None
 
 def load_region_lookup():
-    """Load region lookup from CSV file and cache it"""
+    """Load region lookup from database table and cache it"""
     global _REGION_LOOKUP_CACHE
     if _REGION_LOOKUP_CACHE is not None:
         return _REGION_LOOKUP_CACHE
     
     try:
-        # Try to load from the csv file
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        lookup_path = os.path.join(script_dir, 'final csv files', 'Sales_Country_Region_lookup.csv')
-        
-        if os.path.exists(lookup_path):
-            lookup_df = pd.read_csv(lookup_path)
+        # Load from database table Sales_Country_Region_lookup
+        if 'conn' in st.session_state and st.session_state['conn'] is not None:
+            query = "SELECT Country, Region FROM Sales_Country_Region_lookup"
+            lookup_df = pd.read_sql(query, st.session_state['conn'])
             # Create dictionary mapping country to region
             _REGION_LOOKUP_CACHE = dict(zip(lookup_df['Country'].str.strip(), lookup_df['Region'].str.strip()))
         else:
-            # Fallback to hardcoded mapping if file not found
+            # Fallback to empty dict if no connection
             _REGION_LOOKUP_CACHE = {}
     except Exception as e:
-        print(f"Warning: Could not load region lookup file: {e}")
+        print(f"Warning: Could not load region lookup from database: {e}")
         _REGION_LOOKUP_CACHE = {}
     
     return _REGION_LOOKUP_CACHE
 
 def get_region(country):
-    """Map a country to its region using Sales_Country_Region_lookup.csv
+    """Map a country to its region using Sales_Country_Region_lookup table
     Supports regions: EU, USA, ROW, China, UK
     """
     if not country or pd.isna(country):

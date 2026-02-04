@@ -1690,19 +1690,39 @@ else:
         
         @st.cache_data
         def get_hhi_value(product_line):
-            try:
-                # Database column is HHI_Reference (with underscore), not HHI Reference (with space)
-                query = f"""
-                SELECT HHI FROM HHI_Lookup
-                WHERE HHI_Reference = '{product_line}'
-                """
-                df = pd.read_sql(query, st.session_state['conn'])
-                if not df.empty:
-                    return df['HHI'].iloc[0]
-                return None
-            except Exception as e:
-                st.error(f"Error retrieving HHI value: {str(e)}")
-                return None
+            """
+            Get HHI code for a product line using hardcoded mapping.
+            This is more reliable than querying the database since not all products
+            have HHI entries in the HHI_Lookup table.
+            """
+            # Hardcoded HHI mapping for all product lines
+            hhi_mapping = {
+                'Centargo': 'CT',
+                'CT': 'CT',
+                'CV': 'CV',
+                'Intego': 'Intego',
+                'MR': 'MR',
+                'Protekt': 'Protekt',
+                'Radimetrics': 'Radimetrics',
+                'Universal Disp.': 'Universal Disp.',
+                'Veris': 'MR',
+                'Calantic': 'Calantic',
+                'Arterion': 'AR',
+                'Avanta': 'AV',
+                'Stellant': 'ST',
+                'Stellant Flex': 'ST',
+                'Stellant MP': 'ST',
+                'MRXP': 'MR',
+                'ProVis': 'PV',
+                'Salient': 'SA',
+                'Vistron Plus': 'VP',
+                'Envision/Vistron': 'EV',
+                'SSEP': 'SS',
+                'Universal Disposables': 'UD',
+            }
+            
+            # Return the HHI code if found, otherwise return the product name itself
+            return hhi_mapping.get(product_line, product_line)
         
         def get_p0_value(product_line, numeric_value):
             """
